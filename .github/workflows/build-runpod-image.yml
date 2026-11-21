@@ -1,6 +1,12 @@
 name: Build & Push TRELLIS.2 RunPod Image
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'runpod/**'
+      - '.github/workflows/build-runpod-image.yml'
   workflow_dispatch:
     inputs:
       tag:
@@ -39,7 +45,8 @@ jobs:
         id: meta
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "image=${{ env.REGISTRY }}/${OWNER}/trellis2-runpod:${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          TAG="${{ inputs.tag || 'latest' }}"
+          echo "image=${{ env.REGISTRY }}/${OWNER}/trellis2-runpod:${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -61,5 +68,5 @@ jobs:
           tags: ${{ steps.meta.outputs.image }}
           build-args: |
             MAX_JOBS=2
-            TRELLIS2_REPO=${{ inputs.trellis2_repo }}
-            TRELLIS2_BRANCH=${{ inputs.trellis2_branch }}
+            TRELLIS2_REPO=${{ inputs.trellis2_repo || 'https://github.com/AmrNabil12/TRELLIS.2.git' }}
+            TRELLIS2_BRANCH=${{ inputs.trellis2_branch || 'main' }}

@@ -14,7 +14,9 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import gc
 import io
+import json
 import logging
+import re
 import secrets
 import shutil
 import tempfile
@@ -28,9 +30,11 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
+
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 log = logging.getLogger("trellis2.server")
 logging.basicConfig(
@@ -269,7 +273,7 @@ class JobRecord:
     error: str | None = None
 
     def elapsed_s(self) -> float:
-        end = self.finished_at if self.finished_at is not None else time.monotonic()
+        end = self.finished_at if self.finished_at is not None else time.time()
         start = self.started_at if self.started_at is not None else self.created_at
         return round(max(0.0, end - start), 2)
 
@@ -284,8 +288,20 @@ class JobRecord:
         }
 
 
+def _atomic_replace(src: Path, dst: Path, retries: int = 8) -> None:
+    """Replace dst with src, retrying brief Windows/NFS sharing violations."""
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+
+
 class JobManager:
-    """Single-worker async job queue with bounded on-disk GLB retention."""
+    """Single-worker async job queue with disk-backed status and bounded GLB retention."""
 
     def __init__(
         self,
@@ -297,9 +313,51 @@ class JobManager:
         self._jobs_dir = jobs_dir
         self._max_retained_jobs = max(1, max_retained_jobs)
         self._jobs: dict[str, JobRecord] = {}
-        self._job_order: list[str] = []
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trellis2-job")
+
+    def _write_status(self, record: JobRecord) -> None:
+        job_dir = self._jobs_dir / record.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "job_id": record.job_id,
+            "status": record.status,
+            "stage": record.stage,
+            "created_at": record.created_at,
+            "started_at": record.started_at,
+            "finished_at": record.finished_at,
+            "error": record.error,
+        }
+        tmp_path = job_dir / f"status.{uuid.uuid4().hex[:6]}.tmp"
+        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            _atomic_replace(tmp_path, job_dir / "status.json")
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+    def _read_status(self, job_id: str) -> JobRecord | None:
+        if not _JOB_ID_RE.match(job_id):
+            return None
+        job_dir = self._jobs_dir / job_id
+        status_file = job_dir / "status.json"
+        if not status_file.is_file():
+            return None
+        try:
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+            return JobRecord(
+                job_id=data["job_id"],
+                status=data["status"],
+                stage=data["stage"],
+                created_at=float(data["created_at"]),
+                started_at=float(data["started_at"]) if data.get("started_at") is not None else None,
+                finished_at=float(data["finished_at"]) if data.get("finished_at") is not None else None,
+                glb_path=job_dir / "mesh.glb",
+                error=data.get("error"),
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            log.warning("Failed to read job status for %s: %s", job_id, exc)
+            return None
 
     def submit(self, image: Image.Image, params: GenerationParams) -> JobRecord:
         job_id = uuid.uuid4().hex[:12]
@@ -311,12 +369,12 @@ class JobManager:
             job_id=job_id,
             status="queued",
             stage="queued",
-            created_at=time.monotonic(),
+            created_at=time.time(),
             glb_path=out_path,
         )
         with self._lock:
             self._jobs[job_id] = record
-            self._job_order.append(job_id)
+            self._write_status(record)
             self._prune_locked()
 
         self._executor.submit(self._run_job, job_id, image, params, out_path)
@@ -331,37 +389,62 @@ class JobManager:
                 return
             record.status = "running"
             record.stage = "generating"
-            record.started_at = time.monotonic()
+            record.started_at = time.time()
+            self._write_status(record)
 
+        # Must end in .glb because trimesh.export() infers format from the file extension
+        tmp_glb = out_path.parent / ".mesh.tmp.glb"
         try:
-            self._engine.generate_glb(image, params, out_path)
+            self._engine.generate_glb(image, params, tmp_glb)
+            _atomic_replace(tmp_glb, out_path)
             with self._lock:
                 record.status = "completed"
                 record.stage = "completed"
-                record.finished_at = time.monotonic()
+                record.finished_at = time.time()
+                self._write_status(record)
         except Exception as exc:
+            tmp_glb.unlink(missing_ok=True)
             log.exception("Job %s failed", job_id)
             with self._lock:
                 record.status = "failed"
                 record.stage = "failed"
                 record.error = f"{type(exc).__name__}: {exc}"
-                record.finished_at = time.monotonic()
+                record.finished_at = time.time()
+                self._write_status(record)
 
     def get(self, job_id: str) -> JobRecord | None:
+        if not _JOB_ID_RE.match(job_id):
+            return None
         with self._lock:
-            return self._jobs.get(job_id)
+            record = self._jobs.get(job_id)
+            if record is not None:
+                return record
+        return self._read_status(job_id)
 
     def _prune_locked(self) -> None:
-        while len(self._job_order) > self._max_retained_jobs:
-            oldest_id = self._job_order[0]
-            oldest = self._jobs.get(oldest_id)
-            # Never prune a job currently queued or running
-            if oldest is not None and oldest.status in {"queued", "running"}:
+        if not self._jobs_dir.is_dir():
+            return
+        entries: list[tuple[float, str, Path, str | None]] = []
+        for child in self._jobs_dir.iterdir():
+            if not child.is_dir() or not _JOB_ID_RE.match(child.name):
+                continue
+            rec = self._jobs.get(child.name) or self._read_status(child.name)
+            status_val = rec.status if rec is not None else None
+            created = rec.created_at if rec is not None else child.stat().st_mtime
+            entries.append((created, child.name, child, status_val))
+
+        if len(entries) <= self._max_retained_jobs:
+            return
+        entries.sort(key=lambda item: item[0])
+        excess = len(entries) - self._max_retained_jobs
+        for _, jid, jdir, status_val in entries:
+            if excess <= 0:
                 break
-            self._job_order.pop(0)
-            self._jobs.pop(oldest_id, None)
-            if oldest is not None and oldest.glb_path is not None:
-                shutil.rmtree(oldest.glb_path.parent, ignore_errors=True)
+            if status_val in {"queued", "running"}:
+                continue
+            self._jobs.pop(jid, None)
+            shutil.rmtree(jdir, ignore_errors=True)
+            excess -= 1
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False)
@@ -371,9 +454,9 @@ def _default_jobs_dir() -> Path:
     env_dir = os.environ.get("TRELLIS2_JOBS_DIR")
     if env_dir:
         return Path(env_dir)
-    workspace = Path("/workspace")
-    if workspace.is_dir() and os.access(workspace, os.W_OK):
-        return workspace / "jobs"
+    for root in (Path("/runpod-volume"), Path("/workspace")):
+        if root.is_dir() and os.access(root, os.W_OK):
+            return root / "jobs"
     return Path(tempfile.gettempdir()) / "trellis2_jobs"
 
 
@@ -455,6 +538,17 @@ def create_app(
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    @fastapi_app.get("/ping")
+    def ping() -> Response:
+        if resolved_engine.status == "ready":
+            return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "healthy"})
+        if resolved_engine.status == "loading":
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "error": resolved_engine.error},
+        )
 
     @fastapi_app.get("/health")
     def health() -> dict[str, Any]:

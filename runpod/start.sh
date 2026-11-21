@@ -10,11 +10,20 @@ if [[ -n "${PUBLIC_KEY:-}" ]] && [[ -x /usr/sbin/sshd ]]; then
     /usr/sbin/sshd || echo "Warning: failed to start sshd" >&2
 fi
 
-# Prefer persistent /workspace cache if mounted and writable; otherwise fall back to /root
-if [[ -d /workspace ]] && [[ -w /workspace ]]; then
-    export HF_HOME="${HF_HOME:-/workspace/hf_cache}"
+# Detect persistent storage: /runpod-volume (Serverless) > /workspace (Pods)
+STORAGE_ROOT=""
+if [[ -d /runpod-volume ]] && [[ -w /runpod-volume ]]; then
+    STORAGE_ROOT="/runpod-volume"
+elif [[ -d /workspace ]] && [[ -w /workspace ]]; then
+    STORAGE_ROOT="/workspace"
+fi
+
+if [[ -n "${STORAGE_ROOT}" ]]; then
+    export HF_HOME="${HF_HOME:-${STORAGE_ROOT}/hf_cache}"
+    export TRELLIS2_JOBS_DIR="${TRELLIS2_JOBS_DIR:-${STORAGE_ROOT}/jobs}"
+    mkdir -p "${TRELLIS2_JOBS_DIR}"
 else
-    export HF_HOME="/root/.cache/huggingface"
+    export HF_HOME="${HF_HOME:-/root/.cache/huggingface}"
 fi
 mkdir -p "${HF_HOME}"
 

@@ -110,11 +110,11 @@ RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 ENV PYTHONPATH=/opt/TRELLIS.2:/app \
     OPENCV_IO_ENABLE_OPENEXR=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    HF_HOME=/workspace/hf_cache \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TRELLIS2_MODEL_ID=microsoft/TRELLIS.2-4B \
     TRELLIS2_LOW_VRAM=auto \
-    PORT=8000
+    PORT=8000 \
+    PORT_HEALTH=8000
 
 EXPOSE 8000
 
