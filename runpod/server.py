@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -213,18 +213,52 @@ class Trellis2Engine:
                 "error": self.error,
             }
 
-    def generate_glb(self, image: Image.Image, params: GenerationParams, out_path: Path) -> Path:
-        if self.status != "ready" or self._pipeline is None:
-            raise RuntimeError(f"Model is not ready (status={self.status}, error={self.error})")
+    def _release_vram(self, offload_models: bool = False) -> None:
+        """Free unused neural sub-models, Python garbage, and PyTorch CUDA cache."""
+        if offload_models and self.low_vram and self._pipeline is not None:
+            candidates = list(getattr(self._pipeline, "models", {}).values())
+            for attr in ("image_cond_model", "rembg_model"):
+                extra = getattr(self._pipeline, attr, None)
+                if extra is not None:
+                    candidates.append(extra)
+            for model in candidates:
+                cpu_fn = getattr(model, "cpu", None)
+                if callable(cpu_fn):
+                    try:
+                        cpu_fn()
+                    except Exception:
+                        pass
 
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        gc.collect()
+        if self._torch is not None and self._torch.cuda.is_available():
+            self._torch.cuda.empty_cache()
+            ipc_collect = getattr(self._torch.cuda, "ipc_collect", None)
+            if callable(ipc_collect):
+                ipc_collect()
+
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        return "out of memory" in str(exc).lower() or type(exc).__name__ == "OutOfMemoryError"
+
+    def _run_once(
+        self,
+        image: Image.Image,
+        params: GenerationParams,
+        out_path: Path,
+        pipeline_type: str,
+    ) -> Path:
         mesh = None
         glb = None
-        with self._gpu_lock:
-            try:
+        infer_ctx = (
+            self._torch.inference_mode()
+            if self._torch is not None and hasattr(self._torch, "inference_mode")
+            else nullcontext()
+        )
+        try:
+            with infer_ctx:
                 log.info(
                     "Running TRELLIS.2 pipeline_type=%s seed=%d decimation=%d texture=%d remesh=%s",
-                    params.pipeline_type,
+                    pipeline_type,
                     params.seed,
                     params.decimation_target,
                     params.texture_size,
@@ -234,8 +268,11 @@ class Trellis2Engine:
                     image,
                     seed=params.seed,
                     preprocess_image=params.preprocess_image,
-                    pipeline_type=params.pipeline_type,
+                    pipeline_type=pipeline_type,
                 )[0]
+                # Free diffusion/encoder models & intermediate activations before mesh/texture baking
+                self._release_vram(offload_models=True)
+
                 mesh.simplify(16777216)  # nvdiffrast face limit
                 glb = self._o_voxel.postprocess.to_glb(
                     vertices=mesh.vertices,
@@ -252,13 +289,37 @@ class Trellis2Engine:
                     remesh_project=params.remesh_project,
                     verbose=True,
                 )
+                mesh = None
+                self._release_vram(offload_models=False)
+
                 glb.export(str(out_path), extension_webp=params.extension_webp)
                 return out_path
-            finally:
-                del mesh, glb
-                gc.collect()
-                if self._torch is not None and self._torch.cuda.is_available():
-                    self._torch.cuda.empty_cache()
+        finally:
+            del mesh, glb
+            self._release_vram(offload_models=True)
+
+    def generate_glb(self, image: Image.Image, params: GenerationParams, out_path: Path) -> Path:
+        if self.status != "ready" or self._pipeline is None:
+            raise RuntimeError(f"Model is not ready (status={self.status}, error={self.error})")
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._gpu_lock:
+            try:
+                return self._run_once(image, params, out_path, params.pipeline_type)
+            except Exception as exc:
+                allow_fallback = os.environ.get("TRELLIS2_OOM_FALLBACK", "1") != "0"
+                if (
+                    self._is_cuda_oom(exc)
+                    and self.low_vram
+                    and params.pipeline_type == "1024_cascade"
+                    and allow_fallback
+                ):
+                    log.warning(
+                        "CUDA OOM on pipeline_type=1024_cascade; clearing VRAM and retrying with 1024."
+                    )
+                    self._release_vram(offload_models=True)
+                    return self._run_once(image, params, out_path, "1024")
+                raise
 
 
 @dataclass
@@ -314,6 +375,7 @@ class JobManager:
         self._max_retained_jobs = max(1, max_retained_jobs)
         self._jobs: dict[str, JobRecord] = {}
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trellis2-job")
 
     def _write_status(self, record: JobRecord) -> None:
@@ -365,10 +427,17 @@ class JobManager:
         job_dir.mkdir(parents=True, exist_ok=True)
         out_path = job_dir / "mesh.glb"
 
+        if self._engine.status == "loading":
+            initial_status = "loading_weights"
+            initial_stage = self._engine.stage or "loading_weights"
+        else:
+            initial_status = "queued"
+            initial_stage = "queued"
+
         record = JobRecord(
             job_id=job_id,
-            status="queued",
-            stage="queued",
+            status=initial_status,
+            stage=initial_stage,
             created_at=time.time(),
             glb_path=out_path,
         )
@@ -383,6 +452,34 @@ class JobManager:
     def _run_job(
         self, job_id: str, image: Image.Image, params: GenerationParams, out_path: Path
     ) -> None:
+        last_stage: str | None = None
+        while self._engine.status == "loading":
+            if self._stop_event.is_set():
+                return
+            current_stage = self._engine.stage or "loading_weights"
+            if current_stage != last_stage:
+                with self._lock:
+                    record = self._jobs.get(job_id)
+                    if record is None:
+                        return
+                    record.status = "loading_weights"
+                    record.stage = current_stage
+                    self._write_status(record)
+                last_stage = current_stage
+            self._stop_event.wait(0.05)
+
+        if self._engine.status == "error":
+            with self._lock:
+                record = self._jobs.get(job_id)
+                if record is None:
+                    return
+                record.status = "failed"
+                record.stage = "failed"
+                record.error = f"TRELLIS.2 failed to initialize: {self._engine.error}"
+                record.finished_at = time.time()
+                self._write_status(record)
+            return
+
         with self._lock:
             record = self._jobs.get(job_id)
             if record is None:
@@ -440,13 +537,14 @@ class JobManager:
         for _, jid, jdir, status_val in entries:
             if excess <= 0:
                 break
-            if status_val in {"queued", "running"}:
+            if status_val in {"queued", "loading_weights", "running"}:
                 continue
             self._jobs.pop(jid, None)
             shutil.rmtree(jdir, ignore_errors=True)
             excess -= 1
 
     def shutdown(self) -> None:
+        self._stop_event.set()
         self._executor.shutdown(wait=False)
 
 
@@ -541,10 +639,11 @@ def create_app(
 
     @fastapi_app.get("/ping")
     def ping() -> Response:
-        if resolved_engine.status == "ready":
-            return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "healthy"})
-        if resolved_engine.status == "loading":
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        if resolved_engine.status in {"ready", "loading"}:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"status": "healthy", "model_status": resolved_engine.status},
+            )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"status": "error", "error": resolved_engine.error},
@@ -559,12 +658,18 @@ def create_app(
         image: UploadFile = File(...),
         params: GenerationParams = Depends(parse_generation_params),
     ) -> dict[str, Any]:
-        _require_ready_engine(resolved_engine)
+        if resolved_engine.status == "error":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"TRELLIS.2 failed to initialize: {resolved_engine.error}",
+            )
         pil_image = _decode_uploaded_image(await image.read())
         record = manager.submit(pil_image, params)
         return {
             "job_id": record.job_id,
             "status": record.status,
+            "stage": record.stage,
+            "model_status": resolved_engine.status,
             "status_url": f"/jobs/{record.job_id}",
             "download_url": f"/jobs/{record.job_id}/glb",
         }
@@ -574,7 +679,12 @@ def create_app(
         record = manager.get(job_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown job: {job_id}")
-        return record.to_dict()
+        payload = record.to_dict()
+        payload["model_status"] = resolved_engine.status
+        payload["model_stage"] = resolved_engine.stage
+        if payload.get("status") == "loading_weights":
+            payload["stage"] = resolved_engine.stage or payload.get("stage")
+        return payload
 
     @fastapi_app.get("/jobs/{job_id}/glb", dependencies=[Depends(verify_api_key)])
     def download_job_glb(job_id: str) -> FileResponse:
