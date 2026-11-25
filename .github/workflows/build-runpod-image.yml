@@ -25,6 +25,10 @@ on:
 env:
   REGISTRY: ghcr.io
 
+concurrency:
+  group: build-runpod-image-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -47,6 +51,7 @@ jobs:
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           TAG="${{ inputs.tag || 'latest' }}"
           echo "image=${{ env.REGISTRY }}/${OWNER}/trellis2-runpod:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "cache_ref=${{ env.REGISTRY }}/${OWNER}/trellis2-runpod:buildcache" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -66,6 +71,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.cache_ref }}
+          cache-to: type=registry,ref=${{ steps.meta.outputs.cache_ref }},mode=max
           build-args: |
             MAX_JOBS=2
             TRELLIS2_REPO=${{ inputs.trellis2_repo || 'https://github.com/AmrNabil12/TRELLIS.2.git' }}

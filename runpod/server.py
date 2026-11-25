@@ -1743,7 +1743,16 @@ def patch_cv2_inpaint_fastpath(cv2_mod: Any, np_mod: Any) -> None:
 
 
 def patch_torch_compile_modules(pipeline: Any, torch_mod: Any) -> list[str]:
-    """Apply persistent torch.compile (Inductor, mode='default', dynamic=True) to dense pipeline modules."""
+    """Optionally apply persistent torch.compile to dense backbone modules when TRELLIS2_COMPILE_BACKBONES=1.
+
+    By default (TRELLIS2_COMPILE_BACKBONES=0), whole-backbone compilation is skipped because:
+    - BiRefNet (rembg_model.model) has dynamic Swin/deformable control flow that stalls TorchInductor
+      for 7+ minutes while running in ~0.25s eagerly (never compiled even when opted in).
+    - DINOv3 (image_cond_model) and sparse_structure_decoder run <0.5s total eagerly while adding
+      ~55s+ to worker cold-boot and recompiling at 1024px.
+    Hot-loop pointwise Triton kernels (SparseConvNeXtBlock3d MLP & SparseFeedForwardNet MLP) remain
+    compiled separately via _make_compiled_pointwise under TRELLIS2_TORCH_COMPILE=1.
+    """
     compiled: list[str] = []
     if (
         pipeline is None
@@ -1751,6 +1760,7 @@ def patch_torch_compile_modules(pipeline: Any, torch_mod: Any) -> list[str]:
         or os.name == "nt"
         or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
         or os.environ.get("TRELLIS2_TORCH_COMPILE", "1") == "0"
+        or os.environ.get("TRELLIS2_COMPILE_BACKBONES", "0") != "1"
         or not callable(getattr(torch_mod, "compile", None))
         or not torch_mod.cuda.is_available()
     ):
@@ -1779,17 +1789,6 @@ def patch_torch_compile_modules(pipeline: Any, torch_mod: Any) -> list[str]:
             except Exception as exc:
                 log.debug("Skipping torch.compile for image_cond_model.extract_features: %s", exc)
 
-    rembg = getattr(pipeline, "rembg_model", None)
-    if rembg is not None and not getattr(rembg, "_trellis2_compiled", False):
-        rembg_inner = getattr(rembg, "model", None)
-        if rembg_inner is not None and callable(rembg_inner):
-            try:
-                rembg.model = torch_mod.compile(rembg_inner, mode="default", dynamic=True)
-                rembg._trellis2_compiled = True
-                compiled.append("rembg_model.model")
-            except Exception as exc:
-                log.debug("Skipping torch.compile for rembg_model.model: %s", exc)
-
     if compiled:
         log.info("Enabled persistent torch.compile (Inductor) for: %s", ", ".join(compiled))
     return compiled
@@ -1800,7 +1799,7 @@ def warmup_pipeline_kernels(
     torch_mod: Any,
     model_mgr: VRAMModelManager | None = None,
 ) -> list[str]:
-    """Pre-warm Stage-1 CUDA Graphs & compiled dense kernels at worker boot before /ping reports ready."""
+    """Pre-warm Stage-1 CUDA Graphs & cuDNN/cuBLAS kernels at worker boot before /ping reports ready."""
     warmed: list[str] = []
     if (
         pipeline is None
@@ -1822,6 +1821,19 @@ def warmup_pipeline_kernels(
     infer_ctx = torch_mod.inference_mode() if hasattr(torch_mod, "inference_mode") else nullcontext()
 
     with infer_ctx:
+        rembg = getattr(pipeline, "rembg_model", None)
+        if rembg is not None and callable(rembg):
+            try:
+                if model_mgr is not None:
+                    model_mgr.ensure_on_gpu(
+                        ["rembg_model"], dev, required_free_gb=VRAM_SAFETY_FLOOR_GB + 1.0
+                    )
+                dummy_rgb = Image.new("RGB", (64, 64), (128, 128, 128))
+                _ = rembg(dummy_rgb)
+                warmed.append("rembg_model")
+            except Exception as exc:
+                log.debug("Boot warmup skipped for rembg_model: %s", exc)
+
         cond_1 = None
         img_cond = getattr(pipeline, "image_cond_model", None)
         if img_cond is not None and callable(img_cond):
@@ -2617,8 +2629,22 @@ class Trellis2Engine:
             # Let VRAMModelManager control residency instead of upstream's unconditional .cpu() per call
             pipe.low_vram = False
 
+        def _log_stage(label: str, started: float) -> None:
+            free_now = _cuda_free_gb(torch)
+            if free_now is not None:
+                log.info(
+                    "Stage %-26s done in %.2fs (free VRAM: %.2f GiB)",
+                    label,
+                    time.monotonic() - started,
+                    free_now,
+                )
+            else:
+                log.info("Stage %-26s done in %.2fs", label, time.monotonic() - started)
+
         try:
             if params.preprocess_image:
+                _emit("preprocessing_image")
+                t_st = time.monotonic()
                 if mgr is not None:
                     mgr.ensure_on_gpu(
                         ["rembg_model"],
@@ -2634,8 +2660,11 @@ class Trellis2Engine:
                 image = pipe.preprocess_image(image)
                 if mgr is None:
                     self._release_vram(offload_models=True)
+                _log_stage("preprocess_image", t_st)
 
             torch.manual_seed(params.seed)
+            _emit("extracting_features")
+            t_st = time.monotonic()
             if mgr is not None:
                 mgr.ensure_on_gpu(
                     ["image_cond_model"],
@@ -2662,9 +2691,12 @@ class Trellis2Engine:
             del cond_1024_raw
             if mgr is None:
                 self._release_vram(offload_models=True)
+            _log_stage("get_cond", t_st)
 
             ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
             next_flow = "shape_slat_flow_model_1024" if pipeline_type == "1024" else "shape_slat_flow_model_512"
+            _emit("sampling_sparse_structure")
+            t_st = time.monotonic()
             if mgr is not None:
                 mgr.ensure_on_gpu(
                     ["sparse_structure_flow_model", "sparse_structure_decoder"],
@@ -2675,6 +2707,7 @@ class Trellis2Engine:
             coords = pipe.sample_sparse_structure(cond_512, ss_res, 1, {})
             if mgr is None:
                 self._release_vram(offload_models=True)
+            _log_stage("sample_sparse_structure", t_st)
 
             if pipeline_type == "512":
                 if mgr is not None:
@@ -2746,6 +2779,8 @@ class Trellis2Engine:
                 target_res = 1536 if pipeline_type == "1536_cascade" else 1024
                 max_num_tokens = int(os.environ.get("TRELLIS2_MAX_NUM_TOKENS", "49152"))
 
+                _emit("sampling_shape_512")
+                t_st = time.monotonic()
                 if mgr is not None:
                     mgr.ensure_on_gpu(
                         ["shape_slat_flow_model_512"],
@@ -2764,7 +2799,9 @@ class Trellis2Engine:
                 del cond_512, coords
                 if mgr is None:
                     self._release_vram(offload_models=True)
+                _log_stage("sample_shape_slat_512", t_st)
 
+                t_st = time.monotonic()
                 shape_dec = pipe.models["shape_slat_decoder"]
                 if mgr is not None:
                     self._configure_decoder_residency(shape_dec)
@@ -2812,6 +2849,7 @@ class Trellis2Engine:
                     hr_resolution -= 128
                 del hr_coords
                 res = hr_resolution
+                _log_stage(f"upsample_coords({res})", t_st)
 
                 assert cond_1024_saved is not None
                 cond_1024 = (
@@ -2820,6 +2858,8 @@ class Trellis2Engine:
                     else _move_cond_dict(cond_1024_saved, pipe.device, non_blocking=True)
                 )
                 del cond_1024_saved
+                _emit("sampling_shape_hr")
+                t_st = time.monotonic()
                 if mgr is not None:
                     mgr.ensure_on_gpu(
                         ["shape_slat_flow_model_1024"],
@@ -2836,7 +2876,10 @@ class Trellis2Engine:
                 del hr_unique
                 if mgr is None:
                     self._release_vram(offload_models=True)
+                _log_stage(f"sample_shape_slat({res})", t_st)
 
+                _emit("sampling_tex_hr")
+                t_st = time.monotonic()
                 if mgr is not None:
                     mgr.ensure_on_gpu(
                         ["tex_slat_flow_model_1024"],
@@ -2855,6 +2898,7 @@ class Trellis2Engine:
                 del cond_1024
                 if mgr is None:
                     self._release_vram(offload_models=True)
+                _log_stage(f"sample_tex_slat({res})", t_st)
             else:
                 raise ValueError(f"Invalid pipeline type: {pipeline_type}")
 
@@ -2873,6 +2917,7 @@ class Trellis2Engine:
                 self._release_vram(offload_models=True)
 
             _emit("decoding_geometry")
+            t_st = time.monotonic()
             shape_dec_mod = pipe.models.get("shape_slat_decoder")
             if mgr is not None:
                 mgr.ensure_on_gpu(
@@ -2889,10 +2934,26 @@ class Trellis2Engine:
             del shape_slat
             if mgr is None:
                 self._release_vram(offload_models=True)
+            _log_stage(f"decode_shape_slat({res})", t_st)
 
             m = meshes[0]
             del meshes
+
+            # Stage tex_slat_decoder before deciding whether to overlap CuMesh.fill_holes()
+            # so any LRU eviction + empty_cache() finishes before concurrent CUDA work starts.
+            tex_dec = pipe.models.get("tex_slat_decoder")
+            if mgr is not None:
+                mgr.ensure_on_gpu(
+                    ["tex_slat_decoder"],
+                    pipe.device,
+                    required_free_gb=floor + (6.0 if res >= 1536 else 3.5),
+                )
+                self._configure_decoder_residency(tex_dec)
+            elif tex_dec is not None:
+                tex_dec.low_vram = True
+
             free_after_shape = _cuda_free_gb(torch)
+            overlap_min_free = floor + (8.0 if res >= 1536 else 5.0)
             can_overlap_fill = bool(
                 mgr is not None
                 and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
@@ -2902,7 +2963,7 @@ class Trellis2Engine:
                 and hasattr(torch.cuda, "Stream")
                 and hasattr(torch.cuda, "Event")
                 and free_after_shape is not None
-                and free_after_shape >= (floor + 2.5)
+                and free_after_shape >= overlap_min_free
             )
             fill_thread: threading.Thread | None = None
             fill_stream: Any = None
@@ -2943,17 +3004,8 @@ class Trellis2Engine:
                     self._release_vram(offload_models=False)
 
             _emit("decoding_textures")
+            t_st = time.monotonic()
             try:
-                tex_dec = pipe.models.get("tex_slat_decoder")
-                if mgr is not None:
-                    mgr.ensure_on_gpu(
-                        ["tex_slat_decoder"],
-                        pipe.device,
-                        required_free_gb=floor + (6.0 if res >= 1536 else 3.5),
-                    )
-                    self._configure_decoder_residency(tex_dec)
-                elif tex_dec is not None:
-                    tex_dec.low_vram = True
                 tex_slat_gpu = tex_slat_staged.to(pipe.device) if spill_tex_slat else tex_slat_staged
                 del tex_slat_staged
                 tex_voxels = pipe.decode_tex_slat(tex_slat_gpu, subs)
@@ -2967,6 +3019,7 @@ class Trellis2Engine:
                         torch.cuda.current_stream().wait_stream(fill_stream)
                     if fill_err[0] is not None:
                         raise fill_err[0]
+            _log_stage(f"decode_tex_slat({res})", t_st)
 
             if can_overlap_fill:
                 verts_staged = m.vertices
@@ -3064,6 +3117,7 @@ class Trellis2Engine:
                 mesh.simplify(16777216)  # exact upstream nvdiffrast hardware face limit (no-op when <=16.77M)
 
                 _emit("baking_textures")
+                t_bake = time.monotonic()
                 use_cuda = bool(self._torch is not None and self._torch.cuda.is_available())
                 attr_vol = mesh.attrs.cuda() if use_cuda and hasattr(mesh.attrs, "cuda") else mesh.attrs
                 vox_coords = mesh.coords.cuda() if use_cuda and hasattr(mesh.coords, "cuda") else mesh.coords
@@ -3084,17 +3138,20 @@ class Trellis2Engine:
                 )
                 del attr_vol, vox_coords
                 mesh = None
+                log.info("Stage %-26s done in %.2fs", "baking_textures(to_glb)", time.monotonic() - t_bake)
                 if self._model_mgr is not None:
                     self._release_vram(min_free_gb=VRAM_SAFETY_FLOOR_GB + 1.5)
                 else:
                     self._release_vram(offload_models=False)
 
                 _emit("exporting_glb")
+                t_exp = time.monotonic()
                 local_tmp = Path(tempfile.gettempdir()) / f"trellis2_{uuid.uuid4().hex[:10]}.glb"
                 staging_tmp: Path | None = None
                 try:
                     with _FastLosslessPngContext():
                         glb.export(str(local_tmp), extension_webp=params.extension_webp)
+                    log.info("Stage %-26s done in %.2fs", "exporting_glb", time.monotonic() - t_exp)
                     try:
                         _atomic_replace(local_tmp, out_path)
                     except OSError:
