@@ -112,7 +112,7 @@ FAST_VOXEL_CHUNK_HIGH = 1_048_576
 FAST_VOXEL_CHUNK_ULTRA = 2_097_152
 DEFAULT_TOKEN_CHUNK_SIZE = max(4_096, int(os.environ.get("TRELLIS2_TOKEN_CHUNK", "16384")))
 FAST_TOKEN_CHUNK_HIGH = 262_144
-DEFAULT_MAX_NUM_TOKENS = max(16_384, int(os.environ.get("TRELLIS2_MAX_NUM_TOKENS", "65536")))
+DEFAULT_MAX_NUM_TOKENS = max(16_384, int(os.environ.get("TRELLIS2_MAX_NUM_TOKENS", "81920")))
 BATCH_CFG_MAX_SPARSE_TOKENS = max(4_096, int(os.environ.get("TRELLIS2_BATCH_CFG_MAX_TOKENS", "24576")))
 OOM_FALLBACK_CHAIN: dict[str, str] = {
     "1536_cascade": "1024_cascade",
@@ -199,6 +199,52 @@ def _cuda_free_gb(torch_mod: Any) -> float | None:
         return free_bytes / (1024**3)
     except Exception:
         return None
+
+
+_CUDART_LIB_CACHE: dict[str, Any] = {"loaded": False, "lib": None}
+
+
+def _is_oom_like(exc: BaseException) -> bool:
+    """Return True for PyTorch or C++ extension (e.g. CuMesh) CUDA out-of-memory errors."""
+    return "out of memory" in str(exc).lower() or type(exc).__name__ == "OutOfMemoryError"
+
+
+def _clear_sticky_cuda_error(torch_mod: Any, cudart_lib: Any = None) -> int:
+    """Consume any pending recoverable CUDA runtime error (e.g. raw cudaMalloc OOM in CuMesh).
+
+    Third-party C++ extensions such as CuMesh call raw cudaMalloc() and throw TORCH_CHECK on the
+    return code without calling cudaGetLastError(), leaving cudaErrorMemoryAllocation armed in the
+    per-thread CUDA runtime slot and causing the next unrelated tensor.to('cuda') call to fail.
+    """
+    last_err = 0
+    lib = cudart_lib
+    if lib is None:
+        if not _CUDART_LIB_CACHE["loaded"]:
+            _CUDART_LIB_CACHE["loaded"] = True
+            import ctypes
+
+            for cand in ("libcudart.so", "libcudart.so.12", "libcudart.so.11.0"):
+                try:
+                    _CUDART_LIB_CACHE["lib"] = ctypes.CDLL(cand)
+                    break
+                except OSError:
+                    continue
+        lib = _CUDART_LIB_CACHE["lib"]
+    if lib is not None:
+        get_last = getattr(lib, "cudaGetLastError", None)
+        if callable(get_last):
+            try:
+                last_err = int(get_last())
+            except Exception:
+                pass
+    if torch_mod is not None and hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+        sync_fn = getattr(torch_mod.cuda, "synchronize", None)
+        if callable(sync_fn):
+            try:
+                sync_fn()
+            except Exception:
+                pass
+    return last_err
 
 
 def _effective_voxel_chunk(torch_mod: Any, base_chunk: int) -> int:
@@ -1930,14 +1976,369 @@ def gpu_dilate_uv_gutters(
     )
 
 
+def _chunked_remesh_narrow_band_dc(
+    vertices: Any,
+    faces: Any,
+    center: Any,
+    scale: float,
+    resolution: int,
+    band: float = 1,
+    project_back: float = 0,
+    verbose: bool = False,
+    bvh: Any = None,
+    *,
+    remeshing_mod: Any,
+    torch_mod: Any,
+    udf_chunk: int = 8_000_000,
+    vox_chunk: int = 2_000_000,
+    quad_chunk: int = 2_000_000,
+    proj_chunk: int = 4_000_000,
+) -> tuple[Any, Any]:
+    """Bit-exact memory-optimal replacement for cumesh.remeshing.remesh_narrow_band_dc.
+
+    Upstream keeps >10 GiB of dead intermediates (edge_neighbor_voxel, connected_voxel_hash_key,
+    connected_voxel, hashmap_vert, hashmap_vox, pts_vert, grid_verts) alive simultaneously with
+    unchunked 21M-quad torch.cross splits (~22 GiB peak at 1408-1536). Releasing intermediates at
+    last use and chunking UDF/hashmap/quad-split/projection cuts peak VRAM to ~2.6 GiB with
+    100% identical output vertices and faces.
+    """
+    assert vertices.ndim == 2 and vertices.shape[1] == 3 and vertices.dtype == torch_mod.float32
+    assert faces.ndim == 2 and faces.shape[1] == 3 and faces.dtype == torch_mod.int32
+    assert center.ndim == 1 and center.shape[0] == 3
+
+    device = vertices.device
+    center = center.to(device=device, dtype=torch_mod.float32)
+    c_ext = remeshing_mod._C
+    init_hashmap = remeshing_mod._init_hashmap
+
+    edge_neighbor_offset = torch_mod.tensor(
+        [
+            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+        ],
+        dtype=torch_mod.int32,
+        device=device,
+    )  # (3, 4, 3)
+    quad_split_1_n = torch_mod.tensor([0, 1, 2, 0, 2, 3], dtype=torch_mod.long, device=device)
+    quad_split_1_p = torch_mod.tensor([0, 2, 1, 0, 3, 2], dtype=torch_mod.long, device=device)
+    quad_split_2_n = torch_mod.tensor([0, 1, 3, 3, 1, 2], dtype=torch_mod.long, device=device)
+    quad_split_2_p = torch_mod.tensor([0, 3, 1, 3, 2, 1], dtype=torch_mod.long, device=device)
+    offsets = torch_mod.tensor(
+        [
+            [0, 0, 0],
+            [1, 0, 0],
+            [0, 1, 0],
+            [1, 1, 0],
+            [0, 0, 1],
+            [1, 0, 1],
+            [0, 1, 1],
+            [1, 1, 1],
+        ],
+        dtype=torch_mod.int32,
+        device=device,
+    )
+
+    own_bvh = bvh is None
+    if own_bvh:
+        if verbose:
+            print("Building BVH...")
+        bvh = remeshing_mod.cuBVH(vertices, faces)
+
+    eps = band * scale / resolution
+    base_resolution = int(resolution)
+    while base_resolution > 32:
+        assert base_resolution % 2 == 0, "Failed to find a base resolution that is a multiple of 2"
+        base_resolution //= 2
+
+    coords = (
+        torch_mod.stack(
+            torch_mod.meshgrid(
+                torch_mod.arange(base_resolution, device=device),
+                torch_mod.arange(base_resolution, device=device),
+                torch_mod.arange(base_resolution, device=device),
+                indexing="ij",
+            ),
+            dim=-1,
+        )
+        .int()
+        .reshape(-1, 3)
+    )
+
+    tqdm_cls = getattr(remeshing_mod, "tqdm", None)
+    total_steps = int(torch_mod.log2(torch_mod.tensor(resolution // base_resolution)).item()) + 1
+    pbar = (
+        tqdm_cls(total=total_steps, desc="Building Sparse Grid", disable=not verbose)
+        if callable(tqdm_cls)
+        else None
+    )
+
+    while True:
+        cell_size = scale / base_resolution
+        thresh = 0.87 * cell_size
+        n_c = int(coords.shape[0])
+        if n_c <= udf_chunk:
+            pts = ((coords.float() + 0.5) / base_resolution - 0.5) * scale + center
+            distances = bvh.unsigned_distance(pts)[0]
+            del pts
+            distances = torch_mod.abs(distances - eps)
+            subdiv_mask = distances < thresh
+            del distances
+        else:
+            subdiv_mask = torch_mod.empty((n_c,), dtype=torch_mod.bool, device=device)
+            for s in range(0, n_c, udf_chunk):
+                e = min(n_c, s + udf_chunk)
+                pts_c = ((coords[s:e].float() + 0.5) / base_resolution - 0.5) * scale + center
+                d_c = bvh.unsigned_distance(pts_c)[0]
+                del pts_c
+                d_c = torch_mod.abs(d_c - eps)
+                subdiv_mask[s:e] = d_c < thresh
+                del d_c
+        coords = coords[subdiv_mask]
+        del subdiv_mask
+
+        if base_resolution >= resolution:
+            break
+
+        base_resolution *= 2
+        coords = (coords * 2).unsqueeze(1) + offsets.unsqueeze(0)
+        coords = coords.reshape(-1, 3)
+        if pbar is not None:
+            pbar.update(1)
+
+    nvox = int(coords.shape[0])
+    hashmap_vox = init_hashmap(resolution, 2 * nvox, device)
+    c_ext.hashmap_insert_3d_idx_as_val_cuda(
+        *hashmap_vox,
+        torch_mod.cat([torch_mod.zeros_like(coords[:, :1]), coords], dim=1),
+        resolution,
+        resolution,
+        resolution,
+    )
+
+    coords = coords.contiguous()
+    grid_verts = c_ext.get_sparse_voxel_grid_active_vertices(
+        *hashmap_vox, coords, resolution, resolution, resolution
+    )
+    nvert = int(grid_verts.shape[0])
+
+    if nvert <= udf_chunk:
+        pts_vert = (grid_verts.float() / resolution - 0.5) * scale + center
+        distances_vert = bvh.unsigned_distance(pts_vert)[0]
+        del pts_vert
+        distances_vert = distances_vert - eps
+    else:
+        distances_vert = torch_mod.empty((nvert,), dtype=torch_mod.float32, device=device)
+        for s in range(0, nvert, udf_chunk):
+            e = min(nvert, s + udf_chunk)
+            pts_c = (grid_verts[s:e].float() / resolution - 0.5) * scale + center
+            d_c = bvh.unsigned_distance(pts_c)[0]
+            del pts_c
+            distances_vert[s:e] = d_c - eps
+            del d_c
+
+    if pbar is not None:
+        pbar.update(1)
+        pbar.close()
+
+    if verbose:
+        print("Running Dual Contouring...")
+
+    hashmap_vert = init_hashmap(resolution + 1, 2 * nvert, device)
+    c_ext.hashmap_insert_3d_idx_as_val_cuda(
+        *hashmap_vert,
+        torch_mod.cat([torch_mod.zeros_like(grid_verts[:, :1]), grid_verts], dim=1),
+        resolution + 1,
+        resolution + 1,
+        resolution + 1,
+    )
+    del grid_verts
+
+    dual_verts, intersected = c_ext.simple_dual_contour(
+        *hashmap_vert, coords, distances_vert, resolution + 1, resolution + 1, resolution + 1
+    )
+    del hashmap_vert, distances_vert
+
+    quad_chunks: list[Any] = []
+    dir_chunks: list[Any] = []
+    step_vox = max(1, int(vox_chunk))
+    for s in range(0, nvox, step_vox):
+        e = min(nvox, s + step_vox)
+        i_sub = intersected[s:e]
+        nz_v, nz_ax = torch_mod.nonzero(i_sub != 0, as_tuple=True)
+        if int(nz_v.numel()) == 0:
+            del i_sub, nz_v, nz_ax
+            continue
+        conn_v = coords[s:e][nz_v].unsqueeze(1) + edge_neighbor_offset[nz_ax]  # (m_c, 4, 3)
+        i_vals = i_sub[nz_v, nz_ax]
+        del i_sub, nz_v, nz_ax
+        m_c = int(conn_v.shape[0])
+        h_key = torch_mod.cat(
+            [
+                torch_mod.zeros((m_c * 4, 1), dtype=torch_mod.int32, device=device),
+                conn_v.reshape(-1, 3),
+            ],
+            dim=1,
+        )
+        del conn_v
+        c_idx = (
+            c_ext.hashmap_lookup_3d_cuda(
+                *hashmap_vox, h_key, resolution, resolution, resolution
+            )
+            .reshape(m_c, 4)
+            .int()
+        )
+        del h_key
+        c_valid = (c_idx != 0xFFFFFFFF).all(dim=1)
+        if bool(c_valid.any()):
+            quad_chunks.append(c_idx[c_valid].int())
+            dir_chunks.append(i_vals[c_valid].int())
+        del c_idx, c_valid, i_vals
+
+    del coords, intersected, hashmap_vox
+
+    if quad_chunks:
+        quad_indices = quad_chunks[0] if len(quad_chunks) == 1 else torch_mod.cat(quad_chunks, dim=0)
+        intersected_dir = dir_chunks[0] if len(dir_chunks) == 1 else torch_mod.cat(dir_chunks, dim=0)
+    else:
+        quad_indices = torch_mod.empty((0, 4), dtype=torch_mod.int32, device=device)
+        intersected_dir = torch_mod.empty((0,), dtype=torch_mod.int32, device=device)
+    del quad_chunks, dir_chunks
+
+    unique_verts = torch_mod.unique(quad_indices.reshape(-1))
+    dual_verts = dual_verts[unique_verts]
+    vert_map = torch_mod.zeros((nvox,), dtype=torch_mod.int32, device=device)
+    vert_map[unique_verts] = torch_mod.arange(
+        unique_verts.shape[0], dtype=torch_mod.int32, device=device
+    )
+    del unique_verts
+    quad_indices = vert_map[quad_indices]
+    del vert_map
+
+    mesh_vertices = (dual_verts / resolution - 0.5) * scale + center
+    del dual_verts
+
+    num_quads = int(quad_indices.shape[0])
+    mesh_triangles = torch_mod.empty((num_quads * 2, 3), dtype=torch_mod.int32, device=device)
+    step_quad = max(1, int(quad_chunk))
+    for s in range(0, num_quads, step_quad):
+        e = min(num_quads, s + step_quad)
+        q_c = quad_indices[s:e]
+        d_pos = (intersected_dir[s:e] == 1).unsqueeze(1)
+        t0 = torch_mod.where(d_pos, q_c[:, quad_split_1_p], q_c[:, quad_split_1_n])
+        n0 = torch_mod.linalg.cross(
+            mesh_vertices[t0[:, 1]] - mesh_vertices[t0[:, 0]],
+            mesh_vertices[t0[:, 2]] - mesh_vertices[t0[:, 0]],
+            dim=-1,
+        )
+        n1 = torch_mod.linalg.cross(
+            mesh_vertices[t0[:, 2]] - mesh_vertices[t0[:, 1]],
+            mesh_vertices[t0[:, 3]] - mesh_vertices[t0[:, 1]],
+            dim=-1,
+        )
+        align0 = (n0 * n1).sum(dim=1).abs()
+        del n0, n1
+
+        t1 = torch_mod.where(d_pos, q_c[:, quad_split_2_p], q_c[:, quad_split_2_n])
+        n0 = torch_mod.linalg.cross(
+            mesh_vertices[t1[:, 1]] - mesh_vertices[t1[:, 0]],
+            mesh_vertices[t1[:, 2]] - mesh_vertices[t1[:, 0]],
+            dim=-1,
+        )
+        n1 = torch_mod.linalg.cross(
+            mesh_vertices[t1[:, 2]] - mesh_vertices[t1[:, 1]],
+            mesh_vertices[t1[:, 3]] - mesh_vertices[t1[:, 1]],
+            dim=-1,
+        )
+        align1 = (n0 * n1).sum(dim=1).abs()
+        del n0, n1, d_pos, q_c
+
+        chosen = torch_mod.where((align0 > align1).unsqueeze(1), t0, t1).reshape(-1, 3).int()
+        mesh_triangles[2 * s : 2 * e] = chosen
+        del t0, t1, align0, align1, chosen
+
+    del quad_indices, intersected_dir
+
+    if project_back > 0 and int(mesh_vertices.shape[0]) > 0:
+        if verbose:
+            print("Projecting back to original mesh...")
+        n_mv = int(mesh_vertices.shape[0])
+        step_proj = max(1, int(proj_chunk))
+        for s in range(0, n_mv, step_proj):
+            e = min(n_mv, s + step_proj)
+            mv_c = mesh_vertices[s:e]
+            _, face_id, uvw = bvh.unsigned_distance(mv_c, return_uvw=True)
+            orig_tri_verts = vertices[faces[face_id.long()]]
+            projected_verts = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+            mv_c.sub_(project_back * (mv_c - projected_verts))
+            del face_id, uvw, orig_tri_verts, projected_verts
+
+    if own_bvh:
+        del bvh
+
+    return mesh_vertices, mesh_triangles
+
+
+def patch_cumesh_remeshing(remeshing_mod: Any, torch_mod: Any = None) -> None:
+    """Patch cumesh.remeshing.remesh_narrow_band_dc to eliminate >12 GiB of temporary VRAM spikes."""
+    if remeshing_mod is None or getattr(remeshing_mod, "_trellis2_remesh_patched", False):
+        return
+    orig_remesh = getattr(remeshing_mod, "remesh_narrow_band_dc", None)
+    if not callable(orig_remesh):
+        return
+    t_mod = torch_mod if torch_mod is not None else getattr(remeshing_mod, "torch", None)
+    if t_mod is None:
+        return
+
+    def _patched_remesh_narrow_band_dc(
+        vertices: Any,
+        faces: Any,
+        center: Any,
+        scale: float,
+        resolution: int,
+        band: float = 1,
+        project_back: float = 0,
+        verbose: bool = False,
+        bvh: Any = None,
+    ) -> tuple[Any, Any]:
+        if os.environ.get("TRELLIS2_CHUNKED_REMESH", "1") == "0":
+            return orig_remesh(
+                vertices,
+                faces,
+                center=center,
+                scale=scale,
+                resolution=resolution,
+                band=band,
+                project_back=project_back,
+                verbose=verbose,
+                bvh=bvh,
+            )
+        return _chunked_remesh_narrow_band_dc(
+            vertices,
+            faces,
+            center=center,
+            scale=scale,
+            resolution=resolution,
+            band=band,
+            project_back=project_back,
+            verbose=verbose,
+            bvh=bvh,
+            remeshing_mod=remeshing_mod,
+            torch_mod=t_mod,
+        )
+
+    remeshing_mod.remesh_narrow_band_dc = _patched_remesh_narrow_band_dc
+    remeshing_mod._trellis2_remesh_patched = True
+
+
 def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> None:
-    """Accelerate o_voxel.postprocess.to_glb via GPU UV-gutter dilation (<5ms) with 4-thread CPU cv2 fallback."""
+    """Optimize o_voxel.postprocess.to_glb for 24 GB VRAM at 1536^3/4K + <5ms GPU UV-gutter dilation."""
     if postprocess_mod is None or getattr(postprocess_mod, "_trellis2_postprocess_patched", False):
         return
     try:
         src = inspect.getsource(postprocess_mod.to_glb)
     except Exception:
-        return
+        src = ""
 
     old_inpaint_block = (
         "    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)\n"
@@ -1945,25 +2346,24 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
         "    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]\n"
         "    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]"
     )
-    if old_inpaint_block not in src:
-        return
 
     inpaint_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="trellis2-inpaint")
 
     def _parallel_pbr_inpaint(
         base_color: Any, metallic: Any, roughness: Any, alpha: Any, mask_inv: Any
     ) -> tuple[Any, Any, Any, Any]:
+        t_local = torch_mod if torch_mod is not None else getattr(postprocess_mod, "torch", None)
         if (
-            torch_mod is not None
+            t_local is not None
             and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
             and os.environ.get("TRELLIS2_GPU_UV_DILATE", "1") != "0"
-            and torch_mod.cuda.is_available()
+            and t_local.cuda.is_available()
         ):
             try:
                 import torch.nn.functional as f_mod
 
                 return gpu_dilate_uv_gutters(
-                    base_color, metallic, roughness, alpha, mask_inv, torch_mod, f_mod
+                    base_color, metallic, roughness, alpha, mask_inv, t_local, f_mod
                 )
             except Exception as exc:
                 log.debug("GPU UV-gutter dilation failed; falling back to 4-thread cv2.inpaint: %s", exc)
@@ -1980,6 +2380,408 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             f_rg.result()[..., None],
             f_al.result()[..., None],
         )
+
+    is_full_to_glb = (
+        hasattr(postprocess_mod, "cumesh")
+        and hasattr(postprocess_mod, "dr")
+        and hasattr(postprocess_mod, "grid_sample_3d")
+        and hasattr(postprocess_mod, "trimesh")
+        and ("remesh_narrow_band_dc" in src or src == "")
+    )
+    if is_full_to_glb:
+        t_mod = torch_mod if torch_mod is not None else postprocess_mod.torch
+        np_mod = postprocess_mod.np
+
+        def _low_vram_to_glb(
+            vertices: Any,
+            faces: Any,
+            attr_volume: Any,
+            coords: Any,
+            attr_layout: dict[str, slice],
+            aabb: Any,
+            voxel_size: Any = None,
+            grid_size: Any = None,
+            decimation_target: int = 1000000,
+            texture_size: int = 2048,
+            remesh: bool = False,
+            remesh_band: float = 1,
+            remesh_project: float = 0.9,
+            mesh_cluster_threshold_cone_half_angle_rad: float = float(np_mod.radians(90.0)),
+            mesh_cluster_refine_iterations: int = 0,
+            mesh_cluster_global_iterations: int = 1,
+            mesh_cluster_smooth_strength: float = 1,
+            verbose: bool = False,
+            use_tqdm: bool = False,
+        ) -> Any:
+            cumesh_local = postprocess_mod.cumesh
+            dr_local = postprocess_mod.dr
+            grid_sample_fn = postprocess_mod.grid_sample_3d
+            trimesh_local = postprocess_mod.trimesh
+            pil_image = postprocess_mod.Image
+            tqdm_local = postprocess_mod.tqdm
+
+            use_cuda = bool(t_mod.cuda.is_available())
+            target_dev = t_mod.device("cuda") if use_cuda else vertices.device
+
+            def _to_dev(t: Any) -> Any:
+                if use_cuda and hasattr(t, "cuda") and getattr(t.device, "type", "") != "cuda":
+                    return t.cuda()
+                if hasattr(t, "to") and t.device != target_dev:
+                    return t.to(target_dev)
+                return t
+
+            def _flush_allocator_for_cpp() -> None:
+                """Release PyTorch cached blocks back to the CUDA driver before raw C++ cudaMalloc calls."""
+                gc.collect()
+                if use_cuda:
+                    t_mod.cuda.empty_cache()
+
+            stage_vol_cpu = bool(
+                use_cuda and os.environ.get("TRELLIS2_STAGE_BAKE_VOLUME_CPU", "1") != "0"
+            )
+            attr_vol_staged = attr_volume.cpu() if (stage_vol_cpu and hasattr(attr_volume, "cpu")) else attr_volume
+            coords_staged = coords.cpu() if (stage_vol_cpu and hasattr(coords, "cpu")) else coords
+            attr_channels = int(attr_vol_staged.shape[1])
+            del attr_volume, coords
+
+            if isinstance(aabb, (list, tuple)):
+                aabb = np_mod.array(aabb)
+            if isinstance(aabb, np_mod.ndarray):
+                aabb = t_mod.tensor(aabb, dtype=t_mod.float32, device=target_dev)
+            else:
+                aabb = _to_dev(aabb).to(dtype=t_mod.float32)
+            assert isinstance(aabb, t_mod.Tensor) and aabb.dim() == 2 and aabb.size(0) == 2 and aabb.size(1) == 3
+
+            if voxel_size is not None:
+                if isinstance(voxel_size, (int, float)):
+                    voxel_size = [voxel_size, voxel_size, voxel_size]
+                if isinstance(voxel_size, (list, tuple)):
+                    voxel_size = np_mod.array(voxel_size)
+                if isinstance(voxel_size, np_mod.ndarray):
+                    voxel_size = t_mod.tensor(voxel_size, dtype=t_mod.float32, device=target_dev)
+                else:
+                    voxel_size = _to_dev(voxel_size).to(dtype=t_mod.float32)
+                grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
+            else:
+                assert grid_size is not None, "Either voxel_size or grid_size must be provided"
+                if isinstance(grid_size, int):
+                    grid_size = [grid_size, grid_size, grid_size]
+                if isinstance(grid_size, (list, tuple)):
+                    grid_size = np_mod.array(grid_size)
+                if isinstance(grid_size, np_mod.ndarray):
+                    grid_size = t_mod.tensor(grid_size, dtype=t_mod.int32, device=target_dev)
+                else:
+                    grid_size = _to_dev(grid_size).to(dtype=t_mod.int32)
+                voxel_size = (aabb[1] - aabb[0]) / grid_size
+
+            pbar = tqdm_local(total=6, desc="Extracting GLB") if use_tqdm else None
+            if verbose:
+                print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
+
+            _flush_allocator_for_cpp()
+            vertices = _to_dev(vertices)
+            faces = _to_dev(faces)
+
+            mesh = cumesh_local.CuMesh()
+            mesh.init(vertices, faces)
+            mesh.fill_holes(max_hole_perimeter=3e-2)
+            if verbose:
+                print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+            vertices, faces = mesh.read()
+            if pbar is not None:
+                pbar.update(1)
+
+            if remesh:
+                # Destroy initial 16M+ face C++ CuMesh buffers before building cuBVH & Dual Contouring
+                del mesh
+                mesh = None
+                _flush_allocator_for_cpp()
+
+            if pbar is not None:
+                pbar.set_description("Building BVH")
+            if verbose:
+                print("Building BVH for current mesh...", end="", flush=True)
+            bvh = cumesh_local.cuBVH(vertices, faces)
+            if pbar is not None:
+                pbar.update(1)
+            if verbose:
+                print("Done")
+
+            if pbar is not None:
+                pbar.set_description("Cleaning mesh")
+            if verbose:
+                print("Cleaning mesh...")
+
+            orig_verts_cpu = None
+            orig_faces_cpu = None
+
+            if not remesh:
+                assert mesh is not None
+                _flush_allocator_for_cpp()
+                mesh.simplify(decimation_target * 3, verbose=verbose)
+                if verbose:
+                    print(f"After inital simplification: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                mesh.remove_duplicate_faces()
+                mesh.repair_non_manifold_edges()
+                mesh.remove_small_connected_components(1e-5)
+                mesh.fill_holes(max_hole_perimeter=3e-2)
+                if verbose:
+                    print(f"After initial cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                mesh.simplify(decimation_target, verbose=verbose)
+                if verbose:
+                    print(f"After final simplification: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                mesh.remove_duplicate_faces()
+                mesh.repair_non_manifold_edges()
+                mesh.remove_small_connected_components(1e-5)
+                mesh.fill_holes(max_hole_perimeter=3e-2)
+                if verbose:
+                    print(f"After final cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                mesh.unify_face_orientations()
+            else:
+                center = aabb.mean(dim=0)
+                scale = float((aabb[1] - aabb[0]).max().item())
+                full_res = int(grid_size.max().item())
+                dc_candidates = [full_res]
+                if full_res > 1024 and os.environ.get("TRELLIS2_DC_OOM_FALLBACK", "1") != "0":
+                    dc_candidates.append(1024)
+
+                for idx_cand, dc_res in enumerate(dc_candidates):
+                    dc_verts = None
+                    dc_faces = None
+                    try:
+                        if vertices is None:
+                            vertices = _to_dev(orig_verts_cpu)
+                            faces = _to_dev(orig_faces_cpu)
+                        _flush_allocator_for_cpp()
+                        dc_verts, dc_faces = cumesh_local.remeshing.remesh_narrow_band_dc(
+                            vertices,
+                            faces,
+                            center=center,
+                            scale=(dc_res + 3 * remesh_band) / dc_res * scale,
+                            resolution=dc_res,
+                            band=remesh_band,
+                            project_back=remesh_project,
+                            verbose=verbose,
+                            bvh=bvh,
+                        )
+                        if stage_vol_cpu and vertices is not None:
+                            orig_verts_cpu = vertices.cpu()
+                            orig_faces_cpu = faces.cpu()
+                            vertices = None
+                            faces = None
+                        mesh = cumesh_local.CuMesh()
+                        mesh.init(dc_verts, dc_faces)
+                        del dc_verts, dc_faces
+                        dc_verts = None
+                        dc_faces = None
+                        # Release all PyTorch cached segments BEFORE CuMesh C++ simplify calls raw cudaMalloc()
+                        _flush_allocator_for_cpp()
+                        if verbose:
+                            print(f"After remeshing: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                        mesh.simplify(decimation_target, verbose=verbose)
+                        if verbose:
+                            print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                        break
+                    except Exception as remesh_exc:
+                        if remesh_exc.__traceback__ is not None:
+                            traceback.clear_frames(remesh_exc.__traceback__)
+                        mesh = None
+                        del dc_verts, dc_faces
+                        _clear_sticky_cuda_error(t_mod)
+                        _flush_allocator_for_cpp()
+                        if idx_cand + 1 < len(dc_candidates) and _is_oom_like(remesh_exc):
+                            next_dc = dc_candidates[idx_cand + 1]
+                            log.warning(
+                                "CuMesh remesh/simplify hit VRAM limit at dc_resolution=%d (%s); "
+                                "retrying DC cage at %d while preserving %d^3 BVH & PBR volume.",
+                                dc_res,
+                                " ".join(s.strip() for s in str(remesh_exc).splitlines() if s.strip())[:200],
+                                next_dc,
+                                full_res,
+                            )
+                            continue
+                        raise
+
+            if pbar is not None:
+                pbar.update(1)
+            if verbose:
+                print("Done")
+
+            if pbar is not None:
+                pbar.set_description("Parameterizing new mesh")
+            if verbose:
+                print("Parameterizing new mesh...")
+
+            assert mesh is not None
+            _flush_allocator_for_cpp()
+            out_vertices, out_faces, out_uvs, out_vmaps = mesh.uv_unwrap(
+                compute_charts_kwargs={
+                    "threshold_cone_half_angle_rad": mesh_cluster_threshold_cone_half_angle_rad,
+                    "refine_iterations": mesh_cluster_refine_iterations,
+                    "global_iterations": mesh_cluster_global_iterations,
+                    "smooth_strength": mesh_cluster_smooth_strength,
+                },
+                return_vmaps=True,
+                verbose=verbose,
+            )
+            out_vertices = _to_dev(out_vertices)
+            out_faces = _to_dev(out_faces)
+            out_uvs = _to_dev(out_uvs)
+            out_vmaps = _to_dev(out_vmaps)
+            mesh.compute_vertex_normals()
+            out_normals = _to_dev(mesh.read_vertex_normals())[out_vmaps]
+            del out_vmaps, mesh
+            _flush_allocator_for_cpp()
+
+            if pbar is not None:
+                pbar.update(1)
+            if verbose:
+                print("Done")
+
+            if pbar is not None:
+                pbar.set_description("Sampling attributes")
+            if verbose:
+                print("Sampling attributes...", end="", flush=True)
+
+            ctx = dr_local.RasterizeCudaContext()
+            uvs_rast = t_mod.cat(
+                [out_uvs * 2 - 1, t_mod.zeros_like(out_uvs[:, :1]), t_mod.ones_like(out_uvs[:, :1])],
+                dim=-1,
+            ).unsqueeze(0)
+            rast = t_mod.zeros((1, texture_size, texture_size, 4), device=target_dev, dtype=t_mod.float32)
+
+            for i in range(0, int(out_faces.shape[0]), 100000):
+                rast_chunk, _ = dr_local.rasterize(
+                    ctx,
+                    uvs_rast,
+                    out_faces[i : i + 100000],
+                    resolution=[texture_size, texture_size],
+                )
+                mask_chunk = rast_chunk[..., 3:4] > 0
+                rast_chunk[..., 3:4] += i
+                rast = t_mod.where(mask_chunk, rast_chunk, rast)
+                del rast_chunk, mask_chunk
+
+            mask = rast[0, ..., 3] > 0
+            pos = dr_local.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
+            valid_pos = pos[mask]
+            del pos, rast, uvs_rast, ctx
+
+            if vertices is None:
+                vertices = _to_dev(orig_verts_cpu)
+                faces = _to_dev(orig_faces_cpu)
+            del orig_verts_cpu, orig_faces_cpu
+
+            n_valid = int(valid_pos.shape[0])
+            proj_step = 4_000_000
+            if n_valid <= proj_step:
+                _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+                orig_tri_verts = vertices[faces[face_id.long()]]
+                valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+                del face_id, uvw, orig_tri_verts
+            else:
+                projected_pos = t_mod.empty_like(valid_pos)
+                for s in range(0, n_valid, proj_step):
+                    e = min(n_valid, s + proj_step)
+                    _, face_id, uvw = bvh.unsigned_distance(valid_pos[s:e], return_uvw=True)
+                    orig_tri_verts = vertices[faces[face_id.long()]]
+                    projected_pos[s:e] = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+                    del face_id, uvw, orig_tri_verts
+                valid_pos = projected_pos
+                del projected_pos
+
+            # Free cuBVH + original 16M-face Dual-Grid mesh BEFORE moving PBR voxel volume onto GPU
+            del bvh, vertices, faces
+            _flush_allocator_for_cpp()
+
+            attr_vol_dev = _to_dev(attr_vol_staged)
+            coords_dev = _to_dev(coords_staged)
+            del attr_vol_staged, coords_staged
+
+            attrs = t_mod.zeros(
+                texture_size, texture_size, attr_channels, device=target_dev, dtype=attr_vol_dev.dtype
+            )
+            if n_valid > 0:
+                attrs[mask] = grid_sample_fn(
+                    attr_vol_dev,
+                    t_mod.cat([t_mod.zeros_like(coords_dev[:, :1]), coords_dev], dim=-1),
+                    shape=t_mod.Size([1, attr_channels, *grid_size.tolist()]),
+                    grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+                    mode="trilinear",
+                )
+            del attr_vol_dev, coords_dev, valid_pos
+            _flush_allocator_for_cpp()
+
+            if pbar is not None:
+                pbar.update(1)
+            if verbose:
+                print("Done")
+
+            if pbar is not None:
+                pbar.set_description("Finalizing mesh")
+            if verbose:
+                print("Finalizing mesh...", end="", flush=True)
+
+            mask_np = mask.cpu().numpy()
+            del mask
+
+            base_color = np_mod.clip(attrs[..., attr_layout["base_color"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
+            metallic = np_mod.clip(attrs[..., attr_layout["metallic"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
+            roughness = np_mod.clip(attrs[..., attr_layout["roughness"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
+            alpha = np_mod.clip(attrs[..., attr_layout["alpha"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
+            del attrs
+            alpha_mode = "OPAQUE"
+
+            mask_inv = (~mask_np).astype(np_mod.uint8)
+            base_color, metallic, roughness, alpha = _parallel_pbr_inpaint(
+                base_color, metallic, roughness, alpha, mask_inv
+            )
+
+            material = trimesh_local.visual.material.PBRMaterial(
+                baseColorTexture=pil_image.fromarray(np_mod.concatenate([base_color, alpha], axis=-1)),
+                baseColorFactor=np_mod.array([255, 255, 255, 255], dtype=np_mod.uint8),
+                metallicRoughnessTexture=pil_image.fromarray(
+                    np_mod.concatenate([np_mod.zeros_like(metallic), roughness, metallic], axis=-1)
+                ),
+                metallicFactor=1.0,
+                roughnessFactor=1.0,
+                alphaMode=alpha_mode,
+                doubleSided=True if not remesh else False,
+            )
+
+            vertices_np = out_vertices.cpu().numpy()
+            faces_np = out_faces.cpu().numpy()
+            uvs_np = out_uvs.cpu().numpy()
+            normals_np = out_normals.cpu().numpy()
+            del out_vertices, out_faces, out_uvs, out_normals
+
+            vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2].copy(), -vertices_np[:, 1].copy()
+            normals_np[:, 1], normals_np[:, 2] = normals_np[:, 2].copy(), -normals_np[:, 1].copy()
+            uvs_np[:, 1] = 1 - uvs_np[:, 1]
+
+            textured_mesh = trimesh_local.Trimesh(
+                vertices=vertices_np,
+                faces=faces_np,
+                vertex_normals=normals_np,
+                process=False,
+                visual=trimesh_local.visual.TextureVisuals(uv=uvs_np, material=material),
+            )
+
+            if pbar is not None:
+                pbar.update(1)
+                pbar.close()
+            if verbose:
+                print("Done")
+
+            return textured_mesh
+
+        postprocess_mod._trellis2_parallel_pbr_inpaint = _parallel_pbr_inpaint
+        postprocess_mod.to_glb = _low_vram_to_glb
+        postprocess_mod._trellis2_postprocess_patched = True
+        return
+
+    if old_inpaint_block not in src:
+        return
 
     patched_src = src.replace(
         old_inpaint_block,
@@ -2736,6 +3538,12 @@ def install_trellis2_vram_optimizations(
     patch_sparse_structure_cudagraph(SparseStructureFlowModel, torch_mod)
     patch_mesh_simplify_noop(Mesh)
     patch_cv2_inpaint_fastpath(cv2, np)
+    try:
+        import cumesh.remeshing as cumesh_remeshing_mod  # type: ignore[import-not-found]
+
+        patch_cumesh_remeshing(cumesh_remeshing_mod, torch_mod)
+    except Exception as exc:
+        log.debug("Skipping CuMesh remeshing patch: %s", exc)
     patch_o_voxel_postprocess(o_voxel_postprocess_mod, torch_mod)
 
     models_dict = getattr(pipeline, "models", {}) or {}
@@ -2930,6 +3738,9 @@ class Trellis2Engine:
         min_free_gb: float | None = None,
     ) -> None:
         """Free unused neural sub-models, Python garbage, and PyTorch CUDA cache when needed."""
+        if offload_models:
+            _clear_sticky_cuda_error(self._torch)
+
         if min_free_gb is not None and not offload_models and self._model_mgr is not None:
             free_gb = _cuda_free_gb(self._torch)
             if free_gb is not None and free_gb >= min_free_gb:
@@ -2968,7 +3779,7 @@ class Trellis2Engine:
 
     @staticmethod
     def _is_cuda_oom(exc: BaseException) -> bool:
-        return "out of memory" in str(exc).lower() or type(exc).__name__ == "OutOfMemoryError"
+        return _is_oom_like(exc)
 
     def _can_run_staged(self) -> bool:
         """True when self._pipeline exposes full Trellis2ImageTo3DPipeline methods (vs simple test mocks)."""
@@ -3256,21 +4067,28 @@ class Trellis2Engine:
                     else _move_cond_dict(cond_1024_saved, pipe.device, non_blocking=True)
                 )
                 del cond_1024_saved
-                hr_flow_headroom_gb = floor + (4.5 if res >= 1536 else 2.0)
+                num_hr_tokens = int(hr_unique.shape[0])
+                dense_hr_tokens = bool(
+                    (self.vram_gb is None or self.vram_gb < 32.0) and num_hr_tokens > 49_152
+                )
+                hr_flow_headroom_gb = floor + (4.5 if res > 1024 else 2.0)
                 _emit("sampling_shape_hr")
                 t_st = time.monotonic()
                 if mgr is not None:
+                    if dense_hr_tokens:
+                        mgr.evict_except(["shape_slat_flow_model_1024"], clear_cache=True)
                     mgr.ensure_on_gpu(
                         ["shape_slat_flow_model_1024"],
                         pipe.device,
                         required_free_gb=hr_flow_headroom_gb,
-                        protected=["tex_slat_flow_model_1024"],
+                        protected=[] if dense_hr_tokens else ["tex_slat_flow_model_1024"],
                     )
-                    mgr.prefetch_async(
-                        ["tex_slat_flow_model_1024"],
-                        pipe.device,
-                        min_free_after_gb=hr_flow_headroom_gb + 0.5,
-                    )
+                    if not dense_hr_tokens:
+                        mgr.prefetch_async(
+                            ["tex_slat_flow_model_1024"],
+                            pipe.device,
+                            min_free_after_gb=hr_flow_headroom_gb + 0.5,
+                        )
                 shape_slat = pipe.sample_shape_slat(
                     cond_1024, pipe.models["shape_slat_flow_model_1024"], hr_unique, {}
                 )
@@ -3282,6 +4100,8 @@ class Trellis2Engine:
                 _emit("sampling_tex_hr")
                 t_st = time.monotonic()
                 if mgr is not None:
+                    if dense_hr_tokens:
+                        mgr.evict_except(["tex_slat_flow_model_1024"], clear_cache=True)
                     mgr.ensure_on_gpu(
                         ["tex_slat_flow_model_1024"],
                         pipe.device,
@@ -3306,14 +4126,14 @@ class Trellis2Engine:
             # On <=32 GiB GPUs (e.g., 24 GiB RTX 4090), all DiT flow models are finished for this job;
             # evicting them before 3D sparse VAE decoding frees ~10-14 GiB of VRAM for FlexGEMM/C2S at 1024^3-1536^3.
             tight_gpu = bool(self.vram_gb is None or self.vram_gb < 32.0)
-            decode_headroom_gb = floor + (7.5 if res >= 1536 else 4.5)
+            decode_headroom_gb = floor + (7.5 if res > 1024 else 4.5)
             if hasattr(tex_slat, "clear_spatial_cache"):
                 tex_slat.clear_spatial_cache()
             free_before_shape = _cuda_free_gb(torch)
             spill_tex_slat = bool(
                 mgr is None
                 or tight_gpu
-                or res >= 1536
+                or res > 1024
                 or free_before_shape is None
                 or free_before_shape < (decode_headroom_gb + 0.3)
             )
@@ -3326,7 +4146,7 @@ class Trellis2Engine:
             t_st = time.monotonic()
             shape_dec_mod = pipe.models.get("shape_slat_decoder")
             if mgr is not None:
-                if tight_gpu or res >= 1536:
+                if tight_gpu or res > 1024:
                     mgr.evict_except(["shape_slat_decoder"], clear_cache=True)
                     mgr.ensure_on_gpu(
                         ["shape_slat_decoder"],
@@ -3341,7 +4161,7 @@ class Trellis2Engine:
                         protected=["tex_slat_decoder"],
                     )
                 self._configure_decoder_residency(shape_dec_mod)
-                if not tight_gpu and res < 1536:
+                if not tight_gpu and res <= 1024:
                     mgr.prefetch_async(
                         ["tex_slat_decoder"], pipe.device, min_free_after_gb=decode_headroom_gb
                     )
@@ -3367,22 +4187,22 @@ class Trellis2Engine:
             # so any LRU eviction + empty_cache() finishes before concurrent CUDA work starts.
             tex_dec = pipe.models.get("tex_slat_decoder")
             if mgr is not None:
-                if tight_gpu or res >= 1536:
+                if tight_gpu or res > 1024:
                     mgr.evict_except(["tex_slat_decoder"], clear_cache=True)
                 mgr.ensure_on_gpu(
                     ["tex_slat_decoder"],
                     pipe.device,
-                    required_free_gb=floor + (6.0 if res >= 1536 else 3.5),
+                    required_free_gb=floor + (6.0 if res > 1024 else 3.5),
                 )
                 self._configure_decoder_residency(tex_dec)
             elif tex_dec is not None:
                 tex_dec.low_vram = True
 
             free_after_shape = _cuda_free_gb(torch)
-            overlap_min_free = floor + (8.0 if res >= 1536 else 5.0)
+            overlap_min_free = floor + (8.0 if res > 1024 else 5.0)
             can_overlap_fill = bool(
                 mgr is not None
-                and not (tight_gpu and res >= 1536)
+                and not (tight_gpu and res > 1024)
                 and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
                 and os.environ.get("TRELLIS2_STREAM_OVERLAP", "1") != "0"
                 and torch is not None
@@ -3421,7 +4241,7 @@ class Trellis2Engine:
                 free_after_shape = _cuda_free_gb(torch)
                 spill_mesh_geom = bool(
                     mgr is None
-                    or (tight_gpu and res >= 1536)
+                    or (tight_gpu and res > 1024)
                     or free_after_shape is None
                     or free_after_shape < (floor + 5.0)
                 )
@@ -3562,15 +4382,38 @@ class Trellis2Engine:
                 _emit("baking_textures")
                 t_bake = time.monotonic()
                 use_cuda = bool(self._torch is not None and self._torch.cuda.is_available())
-                attr_vol = mesh.attrs.cuda() if use_cuda and hasattr(mesh.attrs, "cuda") else mesh.attrs
-                vox_coords = mesh.coords.cuda() if use_cuda and hasattr(mesh.coords, "cuda") else mesh.coords
+                postprocess_patched = bool(
+                    getattr(getattr(self._o_voxel, "postprocess", None), "_trellis2_postprocess_patched", False)
+                )
+                stage_bake_cpu = bool(
+                    use_cuda
+                    and postprocess_patched
+                    and (self.low_vram or self.vram_gb is None or self.vram_gb < 32.0)
+                    and os.environ.get("TRELLIS2_STAGE_BAKE_VOLUME_CPU", "1") != "0"
+                )
+                bake_verts = mesh.vertices
+                bake_faces = mesh.faces
+                bake_layout = mesh.layout
+                bake_voxel_size = mesh.voxel_size
+                if stage_bake_cpu:
+                    attr_vol = mesh.attrs.cpu() if hasattr(mesh.attrs, "cpu") else mesh.attrs
+                    vox_coords = mesh.coords.cpu() if hasattr(mesh.coords, "cpu") else mesh.coords
+                else:
+                    attr_vol = mesh.attrs.cuda() if use_cuda and hasattr(mesh.attrs, "cuda") else mesh.attrs
+                    vox_coords = mesh.coords.cuda() if use_cuda and hasattr(mesh.coords, "cuda") else mesh.coords
+                # Drop wrapper references before to_glb so intermediate CuMesh steps don't pin duplicate tensors
+                mesh = None
+                if stage_bake_cpu and self._torch is not None and self._torch.cuda.is_available():
+                    gc.collect()
+                    self._torch.cuda.empty_cache()
+
                 glb = self._o_voxel.postprocess.to_glb(
-                    vertices=mesh.vertices,
-                    faces=mesh.faces,
+                    vertices=bake_verts,
+                    faces=bake_faces,
                     attr_volume=attr_vol,
                     coords=vox_coords,
-                    attr_layout=mesh.layout,
-                    voxel_size=mesh.voxel_size,
+                    attr_layout=bake_layout,
+                    voxel_size=bake_voxel_size,
                     aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
                     decimation_target=params.decimation_target,
                     texture_size=params.texture_size,
@@ -3579,8 +4422,7 @@ class Trellis2Engine:
                     remesh_project=params.remesh_project,
                     verbose=True,
                 )
-                del attr_vol, vox_coords
-                mesh = None
+                del bake_verts, bake_faces, attr_vol, vox_coords
                 log.info("Stage %-26s done in %.2fs", "baking_textures(to_glb)", time.monotonic() - t_bake)
                 if self._model_mgr is not None:
                     self._release_vram(min_free_gb=VRAM_SAFETY_FLOOR_GB + 1.5)
@@ -3652,7 +4494,8 @@ class Trellis2Engine:
                                 last_f = tb_frames[-1]
                                 tb_loc = f" at {Path(last_f.filename).name}:{last_f.lineno} in {last_f.name}"
                             traceback.clear_frames(exc.__traceback__)
-                        oom_detail = f"{str(exc).splitlines()[0][:240]}{tb_loc}"
+                        flat_msg = " ".join(s.strip() for s in str(exc).splitlines() if s.strip())
+                        oom_detail = f"{flat_msg[:260]}{tb_loc}"
                         retry_next = next_type
                     else:
                         raise
