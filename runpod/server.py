@@ -368,6 +368,87 @@ def patch_sparse_convnext_block(
     convnext_cls._trellis2_vram_patched = True
 
 
+def _try_octant_grouped_c2s_conv1(
+    conv1_mod: Any,
+    h: Any,
+    row_idx: Any,
+    subidx: Any,
+    out_ch: int,
+    torch_mod: Any,
+) -> Any | None:
+    """Run SparseResBlockC2S3d.conv1 (C -> 8*out_ch) one octant at a time to cut 7+ GiB spike by 8x.
+
+    Mathematically bit-exact: each octant k in 0..7 uses an independent contiguous slice
+    weight[k*out_ch:(k+1)*out_ch] and bias[k*out_ch:(k+1)*out_ch] while reusing the exact
+    same FlexGEMM SubMConv3d neighbor_cache across all 8 slices.
+    """
+    n_in = int(h.feats.shape[0])
+    min_bytes = int(os.environ.get("TRELLIS2_C2S_GROUPED_CONV1_BYTES", str(1024**3)))
+    est_bytes = n_in * out_ch * 8 * int(h.feats.element_size())
+    if est_bytes < min_bytes:
+        return None
+
+    w_all = getattr(conv1_mod, "weight", None)
+    b_all = getattr(conv1_mod, "bias", None)
+    if w_all is None or getattr(w_all, "ndim", 0) != 5 or int(w_all.shape[0]) != out_ch * 8:
+        return None
+    if b_all is not None and int(b_all.shape[0]) != out_ch * 8:
+        return None
+
+    grouped_fn = getattr(conv1_mod, "_grouped_conv_fn", None)
+    dilation = getattr(conv1_mod, "dilation", (1, 1, 1))
+    if grouped_fn is None:
+        if not bool(getattr(h.feats, "is_cuda", False)):
+            return None
+        try:
+            import flex_gemm  # type: ignore[import-not-found]
+            from flex_gemm.ops.spconv import sparse_submanifold_conv3d  # type: ignore[import-not-found]
+            from trellis2.modules.sparse.conv import config as conv_cfg  # type: ignore[import-not-found]
+        except Exception:
+            return None
+        if getattr(conv_cfg, "CONV", "flex_gemm") != "flex_gemm":
+            return None
+        flex_gemm.ops.spconv.set_algorithm(conv_cfg.FLEX_GEMM_ALGO)
+        flex_gemm.ops.spconv.set_hashmap_ratio(conv_cfg.FLEX_GEMM_HASHMAP_RATIO)
+        grouped_fn = sparse_submanifold_conv3d
+
+    _co, kd, kh, kw, _ci = w_all.shape
+    neighbor_cache_key = f"SubMConv3d_neighbor_cache_{kw}x{kh}x{kd}_dilation{dilation}"
+    neighbor_cache = h.get_spatial_cache(neighbor_cache_key) if hasattr(h, "get_spatial_cache") else None
+    spatial_shape = torch_mod.Size([*h.shape, *h.spatial_shape])
+    n_out = int(row_idx.shape[0])
+    h_up_feats = None
+
+    for k in range(8):
+        mask_k = subidx == k
+        if not bool(mask_k.any()):
+            del mask_k
+            continue
+        w_k = w_all[k * out_ch : (k + 1) * out_ch]
+        b_k = None if b_all is None else b_all[k * out_ch : (k + 1) * out_ch]
+        out_k, nc_ = grouped_fn(
+            h.feats,
+            h.coords,
+            spatial_shape,
+            w_k,
+            b_k,
+            neighbor_cache,
+            dilation,
+        )
+        if neighbor_cache is None and nc_ is not None:
+            neighbor_cache = nc_
+            if hasattr(h, "register_spatial_cache"):
+                h.register_spatial_cache(neighbor_cache_key, neighbor_cache)
+        if h_up_feats is None:
+            h_up_feats = torch_mod.empty((n_out, out_ch), dtype=out_k.dtype, device=out_k.device)
+        h_up_feats[mask_k] = out_k[row_idx[mask_k]]
+        del out_k, mask_k
+
+    if h_up_feats is None:
+        h_up_feats = torch_mod.empty((0, out_ch), dtype=h.feats.dtype, device=h.feats.device)
+    return h_up_feats
+
+
 def patch_sparse_c2s_block(
     c2s_cls: Any,
     sparse_tensor_cls: Any,
@@ -452,10 +533,6 @@ def patch_sparse_c2s_block(
         h = x.replace(normed)
         del x, normed
 
-        h = self.conv1(h)
-        if hasattr(h, "clear_spatial_cache"):
-            h.clear_spatial_cache()
-
         can_fast_c2s = (
             getattr(self.updown, "factor", None) == 2
             and x_coords.ndim == 2
@@ -468,6 +545,8 @@ def patch_sparse_c2s_block(
             if cached_gather is not None:
                 new_coords, flat_idx = cached_gather
                 cached_gather = None
+                row_idx = torch_mod.div(flat_idx, 8, rounding_mode="floor")
+                subidx = flat_idx - row_idx * 8
             else:
                 nz = subdiv_binarized.feats.nonzero()
                 row_idx = nz[:, 0]
@@ -477,7 +556,7 @@ def patch_sparse_c2s_block(
                 new_coords[:, 1:] *= 2
                 shifts = torch_mod.tensor([0, 1, 2], device=x_coords.device, dtype=subidx.dtype)
                 new_coords[:, 1:] += ((subidx[:, None] >> shifts) & 1).to(new_coords.dtype)
-                del nz, row_idx, subidx, shifts
+                del nz, shifts
                 if (
                     self.pred_subdiv
                     and sub_ret is not None
@@ -487,20 +566,38 @@ def patch_sparse_c2s_block(
                     sub_ret._c2s_gather_cache = (new_coords, flat_idx)
 
             x_coords = None
+            subdiv_binarized = None
             h_shape = getattr(h, "_shape", None)
             out_shape = (
-                None if h_shape is None else torch_mod.Size([h_shape[0], h_shape[1] // 8])
+                None if h_shape is None else torch_mod.Size([h_shape[0], self.out_channels])
             )
             h_scale = getattr(h, "_scale", None)
-            h_feats_2d = h.feats.reshape(n_in * 8, -1)
-            del h
-            h_up_feats = h_feats_2d[flat_idx]
-            del h_feats_2d
+
+            h_up_feats = _try_octant_grouped_c2s_conv1(
+                self.conv1, h, row_idx, subidx, int(self.out_channels), torch_mod
+            )
+            del row_idx, subidx
+            if h_up_feats is not None:
+                if hasattr(h, "clear_spatial_cache"):
+                    h.clear_spatial_cache()
+                del h
+            else:
+                h = self.conv1(h)
+                if hasattr(h, "clear_spatial_cache"):
+                    h.clear_spatial_cache()
+                h_feats_2d = h.feats.reshape(n_in * 8, -1)
+                del h
+                h_up_feats = h_feats_2d[flat_idx]
+                del h_feats_2d
+
             h = sparse_tensor_cls(h_up_feats, new_coords, out_shape)
             if h_scale is not None:
                 h._scale = tuple(sc / 2 for sc in h_scale)
-            del h_up_feats, new_coords, subdiv_binarized
+            del h_up_feats, new_coords
         else:
+            h = self.conv1(h)
+            if hasattr(h, "clear_spatial_cache"):
+                h.clear_spatial_cache()
             h = self.updown(h, subdiv_binarized)
 
         n_out = h.feats.shape[0]
@@ -775,6 +872,117 @@ def patch_sparse_unet_decoder(
     decoder_cls._trellis2_vram_patched = True
 
 
+def _chunked_fdg_to_mesh(
+    coords: Any,
+    dual_vertices: Any,
+    intersected_flag: Any,
+    split_weight: Any,
+    aabb: list[list[float]],
+    grid_size: int,
+    torch_mod: Any,
+    o_voxel_c: Any | None = None,
+    edge_chunk: int = 2_000_000,
+) -> tuple[Any, Any] | None:
+    """Bit-exact chunked Dual-Grid mesh extraction avoiding 2.5+ GiB (N,3,4,3) dense edge expansion."""
+    n = int(dual_vertices.shape[0])
+    min_vox = int(os.environ.get("TRELLIS2_CHUNKED_FDG_MIN_VOXELS", "2000000"))
+    if split_weight is None or n < min_vox:
+        return None
+    if o_voxel_c is None:
+        if not bool(getattr(coords, "is_cuda", False)):
+            return None
+        try:
+            from o_voxel import _C as o_voxel_c  # type: ignore[import-not-found]
+        except Exception:
+            return None
+    if not (
+        callable(getattr(o_voxel_c, "hashmap_insert_3d_idx_as_val_cuda", None))
+        and callable(getattr(o_voxel_c, "hashmap_lookup_3d_cuda", None))
+    ):
+        return None
+
+    dev = coords.device
+    gs = [int(grid_size), int(grid_size), int(grid_size)]
+    aabb_t = torch_mod.tensor(aabb, dtype=torch_mod.float32, device=dev)
+    grid_size_t = torch_mod.tensor(gs, dtype=torch_mod.int32, device=dev)
+    voxel_size = (aabb_t[1] - aabb_t[0]) / grid_size_t
+
+    vol = gs[0] * gs[1] * gs[2]
+    key_dtype = torch_mod.uint32 if vol < 2**32 else torch_mod.uint64
+    hashmap_keys = torch_mod.full(
+        (2 * n,), torch_mod.iinfo(key_dtype).max, dtype=key_dtype, device=dev
+    )
+    hashmap_vals = torch_mod.empty((2 * n,), dtype=torch_mod.uint32, device=dev)
+    insert_keys = torch_mod.cat(
+        [torch_mod.zeros((n, 1), dtype=coords.dtype, device=dev), coords], dim=-1
+    )
+    o_voxel_c.hashmap_insert_3d_idx_as_val_cuda(hashmap_keys, hashmap_vals, insert_keys, *gs)
+    del insert_keys
+
+    nz = intersected_flag.nonzero()
+    edge_vox = nz[:, 0]
+    edge_ax = nz[:, 1]
+    m_edges = int(nz.shape[0])
+    del nz
+
+    edge_offsets = torch_mod.tensor(
+        [
+            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+        ],
+        dtype=torch_mod.int32,
+        device=dev,
+    )
+
+    quad_chunks: list[Any] = []
+    for s in range(0, m_edges, edge_chunk):
+        e = min(s + edge_chunk, m_edges)
+        c_len = e - s
+        c_sub = coords[edge_vox[s:e]].unsqueeze(1) + edge_offsets[edge_ax[s:e]]
+        q_keys = torch_mod.cat(
+            [
+                torch_mod.zeros((c_len * 4, 1), dtype=torch_mod.int32, device=dev),
+                c_sub.reshape(-1, 3).int(),
+            ],
+            dim=1,
+        )
+        del c_sub
+        q_idx = o_voxel_c.hashmap_lookup_3d_cuda(hashmap_keys, hashmap_vals, q_keys, *gs).reshape(
+            c_len, 4
+        ).int()
+        del q_keys
+        valid = (q_idx != 0xFFFFFFFF).all(dim=1)
+        if bool(valid.any()):
+            quad_chunks.append(q_idx[valid].int())
+        del q_idx, valid
+
+    del hashmap_keys, hashmap_vals, edge_vox, edge_ax, edge_offsets
+    quad_indices = (
+        torch_mod.cat(quad_chunks, dim=0)
+        if quad_chunks
+        else torch_mod.empty((0, 4), dtype=torch_mod.int32, device=dev)
+    )
+    del quad_chunks
+
+    mesh_vertices = (coords.float() + dual_vertices) * voxel_size + aabb_t[0].reshape(1, 3)
+
+    num_quads = int(quad_indices.shape[0])
+    mesh_triangles = torch_mod.empty((num_quads * 2, 3), dtype=quad_indices.dtype, device=dev)
+    quad_split_1 = torch_mod.tensor([0, 1, 2, 0, 2, 3], dtype=torch_mod.long, device=dev)
+    quad_split_2 = torch_mod.tensor([0, 1, 3, 3, 1, 2], dtype=torch_mod.long, device=dev)
+    for s in range(0, num_quads, edge_chunk):
+        e = min(s + edge_chunk, num_quads)
+        q_sub = quad_indices[s:e]
+        sw = split_weight[q_sub]
+        cond = (sw[:, 0] * sw[:, 2]) > (sw[:, 1] * sw[:, 3])
+        tris = torch_mod.where(cond, q_sub[:, quad_split_1], q_sub[:, quad_split_2]).reshape(-1, 3)
+        mesh_triangles[2 * s : 2 * e].copy_(tris)
+        del q_sub, sw, cond, tris
+    del quad_indices
+    return mesh_vertices, mesh_triangles
+
+
 def patch_fdg_decoder(
     fdg_cls: Any,
     base_decoder_cls: Any,
@@ -829,20 +1037,28 @@ def patch_fdg_decoder(
                 free_gb = _cuda_free_gb(torch_mod)
                 if torch_mod.cuda.is_available() and (free_gb is None or free_gb < VRAM_SAFETY_FLOOR_GB + 1.0):
                     torch_mod.cuda.empty_cache()
-            meshes.append(
-                mesh_cls(
-                    *dual_grid_fn(
-                        c_b,
-                        v_f,
-                        i_f,
-                        q_f,
-                        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                        grid_size=self.resolution,
-                        train=False,
-                    )
-                )
+            aabb_box = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]
+            extracted = _chunked_fdg_to_mesh(
+                c_b,
+                v_f,
+                i_f,
+                q_f,
+                aabb=aabb_box,
+                grid_size=self.resolution,
+                torch_mod=torch_mod,
             )
-            del c_b, v_f, i_f, q_f
+            if extracted is None:
+                extracted = dual_grid_fn(
+                    c_b,
+                    v_f,
+                    i_f,
+                    q_f,
+                    aabb=aabb_box,
+                    grid_size=self.resolution,
+                    train=False,
+                )
+            meshes.append(mesh_cls(*extracted))
+            del extracted, c_b, v_f, i_f, q_f
 
         out_list[0] = meshes
         return out_list[0] if len(out_list) == 1 else tuple(out_list)
@@ -2407,6 +2623,35 @@ def patch_dit_block_streaming(slat_flow_cls: Any) -> None:
     slat_flow_cls._trellis2_dit_stream_patched = True
 
 
+def _freeze_pipeline_parameters(pipeline: Any) -> int:
+    """Set requires_grad_(False) on all pipeline sub-models for pure inference.
+
+    PyTorch's autograd.Function ctx.needs_input_grad inspects tensor.requires_grad even inside
+    torch.inference_mode(). Freezing model parameters forces FlexGEMM's SubMConv3dFunction onto
+    its *_no_bwd neighbor-map path, saving ~7-9 GiB of backward-only buffers at 1536^3.
+    """
+    frozen = 0
+    seen: set[int] = set()
+    candidates: list[Any] = list((getattr(pipeline, "models", None) or {}).values())
+    for attr in ("image_cond_model", "rembg_model"):
+        extra = getattr(pipeline, attr, None)
+        if extra is not None:
+            candidates.append(extra)
+    for obj in candidates:
+        for mod in (obj, getattr(obj, "model", None)):
+            if mod is None or id(mod) in seen:
+                continue
+            seen.add(id(mod))
+            req_fn = getattr(mod, "requires_grad_", None)
+            if callable(req_fn):
+                try:
+                    req_fn(False)
+                    frozen += 1
+                except Exception:
+                    pass
+    return frozen
+
+
 def install_trellis2_vram_optimizations(
     pipeline: Any,
     torch_mod: Any,
@@ -2494,6 +2739,8 @@ def install_trellis2_vram_optimizations(
     patch_o_voxel_postprocess(o_voxel_postprocess_mod, torch_mod)
 
     models_dict = getattr(pipeline, "models", {}) or {}
+    frozen_mods = _freeze_pipeline_parameters(pipeline)
+    log.info("Froze inference parameters (requires_grad=False) on %d pipeline modules", frozen_mods)
     # On >=20 GiB GPUs (e.g. 24 GB RTX 4090 / A10G / L4), keep the 0.42 GiB decoders 100% GPU-resident
     # during decode; only force stage-by-stage CPU streaming on <20 GiB cards.
     force_decoder_stream = bool(low_vram and vram_gb is not None and vram_gb < 20.0)
@@ -3398,10 +3645,15 @@ class Trellis2Engine:
                         and allow_fallback
                         and next_type is not None
                     ):
-                        oom_detail = str(exc).splitlines()[0][:240]
-                        retry_next = next_type
+                        tb_loc = ""
                         if exc.__traceback__ is not None:
+                            tb_frames = traceback.extract_tb(exc.__traceback__)
+                            if tb_frames:
+                                last_f = tb_frames[-1]
+                                tb_loc = f" at {Path(last_f.filename).name}:{last_f.lineno} in {last_f.name}"
                             traceback.clear_frames(exc.__traceback__)
+                        oom_detail = f"{str(exc).splitlines()[0][:240]}{tb_loc}"
+                        retry_next = next_type
                     else:
                         raise
                 if retry_next is not None:
