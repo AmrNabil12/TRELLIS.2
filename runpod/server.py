@@ -75,6 +75,7 @@ import shutil
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -384,12 +385,14 @@ def patch_sparse_c2s_block(
             return orig_forward(self, x, subdiv)
 
         step = _effective_voxel_chunk(torch_mod, chunk_size)
+        n_in = x.feats.shape[0]
         is_cuda_x = bool(getattr(x.feats, "is_cuda", False))
         free_gb = _cuda_free_gb(torch_mod) if is_cuda_x else None
         keep_sub_on_gpu = bool(
             os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
             and is_cuda_x
-            and (free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 1.0)
+            and n_in < 1_000_000
+            and (free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 6.0)
         )
 
         sub_ret = None
@@ -426,7 +429,6 @@ def patch_sparse_c2s_block(
                 )
                 del sub_dev
 
-        n_in = x.feats.shape[0]
         normed = torch_mod.empty_like(x.feats)
         for s in range(0, n_in, step):
             e = min(s + step, n_in)
@@ -440,8 +442,10 @@ def patch_sparse_c2s_block(
         x_shape = getattr(x, "_shape", None)
         offload_skip = bool(
             is_cuda_x
-            and n_in >= 500_000
-            and (free_gb is not None and free_gb < VRAM_SAFETY_FLOOR_GB + 3.5)
+            and (
+                n_in >= 1_500_000
+                or (n_in >= 500_000 and free_gb is not None and free_gb < VRAM_SAFETY_FLOOR_GB + 6.0)
+            )
         )
         x_feats_saved = x.feats.cpu() if offload_skip else x.feats
 
@@ -482,12 +486,16 @@ def patch_sparse_c2s_block(
                 ):
                     sub_ret._c2s_gather_cache = (new_coords, flat_idx)
 
+            x_coords = None
             h_shape = getattr(h, "_shape", None)
             out_shape = (
                 None if h_shape is None else torch_mod.Size([h_shape[0], h_shape[1] // 8])
             )
-            h_up_feats = h.feats.reshape(n_in * 8, -1)[flat_idx]
             h_scale = getattr(h, "_scale", None)
+            h_feats_2d = h.feats.reshape(n_in * 8, -1)
+            del h
+            h_up_feats = h_feats_2d[flat_idx]
+            del h_feats_2d
             h = sparse_tensor_cls(h_up_feats, new_coords, out_shape)
             if h_scale is not None:
                 h._scale = tuple(sc / 2 for sc in h_scale)
@@ -502,6 +510,11 @@ def patch_sparse_c2s_block(
             f_mod.silu(tmp, inplace=True)
             h.feats[s:e].copy_(tmp)
             del tmp
+
+        if is_cuda_x and n_out >= 1_000_000:
+            free_pre_conv2 = _cuda_free_gb(torch_mod)
+            if free_pre_conv2 is not None and free_pre_conv2 < VRAM_SAFETY_FLOOR_GB + 6.0:
+                torch_mod.cuda.empty_cache()
 
         h = self.conv2(h)
 
@@ -598,6 +611,7 @@ def patch_sparse_unet_decoder(
 
         subs = []
         saved_stage_caches: dict[int, dict[str, Any]] = {}
+        cross_cache_max_voxels = 1_000_000
         num_stages = len(self.blocks)
         try:
             for i, res in enumerate(self.blocks):
@@ -608,14 +622,26 @@ def patch_sparse_unet_decoder(
                         scale_k = str(getattr(h, "_scale", ""))
                         h._spatial_cache[scale_k] = stage_dict
 
+                if is_cuda_x and saved_stage_caches and i >= 2:
+                    free_stage = _cuda_free_gb(torch_mod)
+                    if free_stage is not None and free_stage < VRAM_SAFETY_FLOOR_GB + 5.0:
+                        saved_stage_caches.clear()
+                        torch_mod.cuda.empty_cache()
+
                 if stream and num_res > 0:
                     res.to(dev)
                 try:
                     for j, block in enumerate(res):
                         if i < num_stages - 1 and j == num_res - 1:
-                            if return_subs and self.pred_subdiv and share_cross_cache and hasattr(h, "_spatial_cache"):
+                            if (
+                                return_subs
+                                and self.pred_subdiv
+                                and share_cross_cache
+                                and hasattr(h, "_spatial_cache")
+                                and h.coords.shape[0] <= cross_cache_max_voxels
+                            ):
                                 free_gb = _cuda_free_gb(torch_mod) if is_cuda_x else None
-                                if free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 1.5:
+                                if free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 7.0:
                                     cur_sc = h._spatial_cache.get(str(getattr(h, "_scale", "")))
                                     if cur_sc:
                                         filtered = {k: v for k, v in cur_sc.items() if k != "subdivision"}
@@ -645,9 +671,10 @@ def patch_sparse_unet_decoder(
                     and self.pred_subdiv
                     and share_cross_cache
                     and hasattr(h, "_spatial_cache")
+                    and h.coords.shape[0] <= cross_cache_max_voxels
                 ):
                     free_gb = _cuda_free_gb(torch_mod) if is_cuda_x else None
-                    if free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 2.5:
+                    if free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 7.0:
                         cur_sc = h._spatial_cache.get(str(getattr(h, "_scale", "")))
                         if cur_sc:
                             filtered = {k: v for k, v in cur_sc.items() if k != "subdivision"}
@@ -656,9 +683,12 @@ def patch_sparse_unet_decoder(
 
                 if hasattr(h, "clear_spatial_cache"):
                     h.clear_spatial_cache()
-                if stream and i >= 1:
+                if is_cuda_x and i >= 1:
                     free_gb = _cuda_free_gb(torch_mod)
-                    if free_gb is not None and free_gb < VRAM_SAFETY_FLOOR_GB:
+                    flush_threshold = VRAM_SAFETY_FLOOR_GB if stream else VRAM_SAFETY_FLOOR_GB + 2.5
+                    if free_gb is not None and free_gb < flush_threshold:
+                        if saved_stage_caches:
+                            saved_stage_caches.clear()
                         torch_mod.cuda.empty_cache()
         finally:
             if cross_caches is not None:
@@ -2143,6 +2173,10 @@ class VRAMModelManager:
         cpu_fn = getattr(obj, "cpu", None)
         if callable(cpu_fn):
             cpu_fn()
+        else:
+            inner = self._unwrap_module(obj)
+            if inner is not obj and callable(getattr(inner, "cpu", None)):
+                inner.cpu()
         self._resident_lru.pop(name, None)
         self._pin_on_cpu(name)
 
@@ -2270,6 +2304,27 @@ class VRAMModelManager:
                 self._resident_lru[n] = self._tick
             except Exception:
                 pass
+
+    def evict_except(self, keep: Sequence[str] = (), clear_cache: bool = True) -> int:
+        """Evict all GPU-resident models not in `keep` back to pinned CPU RAM."""
+        keep_set = set(keep)
+        if self._prefetch_stream is not None:
+            try:
+                self._prefetch_stream.synchronize()
+            except Exception:
+                pass
+        evicted = 0
+        for name in list(self._resident_lru.keys()):
+            if name not in keep_set:
+                self._move_to_cpu(name)
+                evicted += 1
+        for name in list(self._inflight_events.keys()):
+            if name not in keep_set:
+                self._move_to_cpu(name)
+                evicted += 1
+        if clear_cache and self._torch is not None and self._torch.cuda.is_available():
+            self._torch.cuda.empty_cache()
+        return evicted
 
     def evict_all(self) -> None:
         """Force-evict all models to CPU (used only during emergency OOM recovery)."""
@@ -3001,12 +3056,17 @@ class Trellis2Engine:
             else:
                 raise ValueError(f"Invalid pipeline type: {pipeline_type}")
 
+            # On <=32 GiB GPUs (e.g., 24 GiB RTX 4090), all DiT flow models are finished for this job;
+            # evicting them before 3D sparse VAE decoding frees ~10-14 GiB of VRAM for FlexGEMM/C2S at 1024^3-1536^3.
+            tight_gpu = bool(self.vram_gb is None or self.vram_gb < 32.0)
             decode_headroom_gb = floor + (7.5 if res >= 1536 else 4.5)
             if hasattr(tex_slat, "clear_spatial_cache"):
                 tex_slat.clear_spatial_cache()
             free_before_shape = _cuda_free_gb(torch)
             spill_tex_slat = bool(
                 mgr is None
+                or tight_gpu
+                or res >= 1536
                 or free_before_shape is None
                 or free_before_shape < (decode_headroom_gb + 0.3)
             )
@@ -3019,15 +3079,32 @@ class Trellis2Engine:
             t_st = time.monotonic()
             shape_dec_mod = pipe.models.get("shape_slat_decoder")
             if mgr is not None:
-                mgr.ensure_on_gpu(
-                    ["shape_slat_decoder"],
-                    pipe.device,
-                    required_free_gb=decode_headroom_gb,
-                    protected=["tex_slat_decoder"],
-                )
+                if tight_gpu or res >= 1536:
+                    mgr.evict_except(["shape_slat_decoder"], clear_cache=True)
+                    mgr.ensure_on_gpu(
+                        ["shape_slat_decoder"],
+                        pipe.device,
+                        required_free_gb=decode_headroom_gb,
+                    )
+                else:
+                    mgr.ensure_on_gpu(
+                        ["shape_slat_decoder"],
+                        pipe.device,
+                        required_free_gb=decode_headroom_gb,
+                        protected=["tex_slat_decoder"],
+                    )
                 self._configure_decoder_residency(shape_dec_mod)
-                mgr.prefetch_async(
-                    ["tex_slat_decoder"], pipe.device, min_free_after_gb=decode_headroom_gb
+                if not tight_gpu and res < 1536:
+                    mgr.prefetch_async(
+                        ["tex_slat_decoder"], pipe.device, min_free_after_gb=decode_headroom_gb
+                    )
+            free_pre_decode = _cuda_free_gb(torch)
+            if free_pre_decode is not None:
+                log.info(
+                    "Starting decode_shape_slat(%d) (free VRAM: %.2f GiB, streaming=%s)",
+                    res,
+                    free_pre_decode,
+                    bool(getattr(shape_dec_mod, "low_vram", False)),
                 )
             meshes, subs = pipe.decode_shape_slat(shape_slat, res)
             _flush_flex_gemm_autotune_cache()
@@ -3043,6 +3120,8 @@ class Trellis2Engine:
             # so any LRU eviction + empty_cache() finishes before concurrent CUDA work starts.
             tex_dec = pipe.models.get("tex_slat_decoder")
             if mgr is not None:
+                if tight_gpu or res >= 1536:
+                    mgr.evict_except(["tex_slat_decoder"], clear_cache=True)
                 mgr.ensure_on_gpu(
                     ["tex_slat_decoder"],
                     pipe.device,
@@ -3056,6 +3135,7 @@ class Trellis2Engine:
             overlap_min_free = floor + (8.0 if res >= 1536 else 5.0)
             can_overlap_fill = bool(
                 mgr is not None
+                and not (tight_gpu and res >= 1536)
                 and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
                 and os.environ.get("TRELLIS2_STREAM_OVERLAP", "1") != "0"
                 and torch is not None
@@ -3094,13 +3174,14 @@ class Trellis2Engine:
                 free_after_shape = _cuda_free_gb(torch)
                 spill_mesh_geom = bool(
                     mgr is None
+                    or (tight_gpu and res >= 1536)
                     or free_after_shape is None
-                    or free_after_shape < (floor + 3.0)
+                    or free_after_shape < (floor + 5.0)
                 )
                 verts_staged = m.vertices.cpu() if spill_mesh_geom else m.vertices
                 faces_staged = m.faces.cpu() if spill_mesh_geom else m.faces
                 del m
-                if mgr is None:
+                if mgr is None or spill_mesh_geom:
                     self._release_vram(offload_models=False)
 
             _emit("decoding_textures")
@@ -3214,9 +3295,17 @@ class Trellis2Engine:
                         pass
                     mesh = self._pipeline.run(image, **run_kwargs)[0]
 
-                # Ensure >= (4 GiB floor + 2.5 GiB = 6.5 GiB) free for cuBVH/CuMesh/nvdiffrast baking
+                # Free neural models before CuMesh/cuBVH/nvdiffrast high-res baking (no models needed after decode)
                 if self._model_mgr is not None:
-                    self._release_vram(min_free_gb=VRAM_SAFETY_FLOOR_GB + 2.5)
+                    if (
+                        self.vram_gb is None
+                        or self.vram_gb < 32.0
+                        or params.texture_size >= 4096
+                        or params.decimation_target >= 1_000_000
+                    ):
+                        self._model_mgr.evict_except([], clear_cache=True)
+                    else:
+                        self._release_vram(min_free_gb=VRAM_SAFETY_FLOOR_GB + 2.5)
                 else:
                     self._release_vram(offload_models=True)
 
@@ -3295,6 +3384,8 @@ class Trellis2Engine:
         current_type = params.pipeline_type
         with self._gpu_lock:
             while True:
+                retry_next: str | None = None
+                oom_detail = ""
                 try:
                     return self._run_once(
                         image, params, out_path, current_type, on_stage=on_stage
@@ -3307,17 +3398,26 @@ class Trellis2Engine:
                         and allow_fallback
                         and next_type is not None
                     ):
-                        log.warning(
-                            "CUDA OOM on pipeline_type=%s; clearing VRAM and retrying with %s.",
-                            current_type,
-                            next_type,
-                        )
-                        if on_stage is not None:
-                            on_stage(f"retrying_{next_type}_after_oom")
-                        self._release_vram(offload_models=True)
-                        current_type = next_type
-                        continue
-                    raise
+                        oom_detail = str(exc).splitlines()[0][:240]
+                        retry_next = next_type
+                        if exc.__traceback__ is not None:
+                            traceback.clear_frames(exc.__traceback__)
+                    else:
+                        raise
+                if retry_next is not None:
+                    log.warning(
+                        "CUDA OOM on pipeline_type=%s (%s); clearing VRAM and retrying with %s.",
+                        current_type,
+                        oom_detail,
+                        retry_next,
+                    )
+                    if on_stage is not None:
+                        on_stage(f"retrying_{retry_next}_after_oom")
+                    self._release_vram(offload_models=True)
+                    free_after = _cuda_free_gb(self._torch)
+                    if free_after is not None:
+                        log.info("VRAM recovered after OOM cleanup: %.2f GiB free", free_after)
+                    current_type = retry_next
 
 
 @dataclass
