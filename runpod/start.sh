@@ -22,14 +22,18 @@ if [[ -n "${STORAGE_ROOT}" ]]; then
     export HF_HOME="${HF_HOME:-${STORAGE_ROOT}/hf_cache}"
     export TRELLIS2_JOBS_DIR="${TRELLIS2_JOBS_DIR:-${STORAGE_ROOT}/jobs}"
     export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${STORAGE_ROOT}/triton_cache}"
+    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${STORAGE_ROOT}/torchinductor_cache}"
     export FLEX_GEMM_AUTOTUNE_CACHE_PATH="${FLEX_GEMM_AUTOTUNE_CACHE_PATH:-${STORAGE_ROOT}/flex_gemm_autotune_cache.json}"
-    mkdir -p "${TRELLIS2_JOBS_DIR}" "${TRITON_CACHE_DIR}"
+    mkdir -p "${TRELLIS2_JOBS_DIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
 else
     export HF_HOME="${HF_HOME:-/root/.cache/huggingface}"
     export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/.cache/triton}"
+    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/root/.cache/torchinductor}"
     export FLEX_GEMM_AUTOTUNE_CACHE_PATH="${FLEX_GEMM_AUTOTUNE_CACHE_PATH:-/root/.cache/flex_gemm_autotune_cache.json}"
-    mkdir -p "${TRITON_CACHE_DIR}"
+    mkdir -p "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
 fi
+export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
+export TORCHINDUCTOR_AUTOGRAD_CACHE="${TORCHINDUCTOR_AUTOGRAD_CACHE:-1}"
 export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
 mkdir -p "${HF_HOME}"
 

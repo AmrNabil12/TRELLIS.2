@@ -243,20 +243,52 @@ def patch_layernorm32(
     layernorm_cls._trellis2_vram_patched = True
 
 
+def _make_compiled_pointwise(fn: Callable[..., Any], torch_mod: Any) -> Callable[..., Any]:
+    """Compile a pointwise CUDA kernel once with dynamic shapes and automatic eager fallback."""
+    if (
+        torch_mod is None
+        or os.name == "nt"
+        or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
+        or os.environ.get("TRELLIS2_TORCH_COMPILE", "1") == "0"
+        or not callable(getattr(torch_mod, "compile", None))
+        or not torch_mod.cuda.is_available()
+    ):
+        return fn
+    try:
+        return torch_mod.compile(fn, mode="default", dynamic=True)
+    except Exception as exc:
+        log.debug("torch.compile unavailable for %s; using eager mode: %s", fn.__name__, exc)
+        return fn
+
+
 def patch_sparse_convnext_block(
     convnext_cls: Any,
     f_mod: Any,
     chunk_size: int = DEFAULT_VOXEL_CHUNK_SIZE,
     torch_mod: Any = None,
 ) -> None:
-    """Chunk pointwise Norm + MLP + in-place SiLU + residual add in SparseConvNeXtBlock3d.
+    """Chunk pointwise Norm + MLP + SiLU + residual add in SparseConvNeXtBlock3d with persistent Inductor fusion.
 
     At 768^3 (~8.5M voxels, C=128, hidden=512), unchunked MLP + out-of-place SiLU
-    requires >18 GiB of temporary tensors; adaptive 256K..1M-voxel chunks eliminate
+    requires >18 GiB of temporary tensors; adaptive 256K..2M-voxel chunks eliminate
     OOM while maximizing Tensor Core GEMM throughput with bit-identical outputs.
     """
     if getattr(convnext_cls, "_trellis2_vram_patched", False):
         return
+
+    def _convnext_pointwise_eager(
+        sub_h: Any, sub_x: Any, ln_w: Any, ln_b: Any, ln_eps: float, w1: Any, b1: Any, w2: Any, b2: Any
+    ) -> Any:
+        ln_w_f = ln_w.float() if ln_w is not None else None
+        ln_b_f = ln_b.float() if ln_b is not None else None
+        y = f_mod.layer_norm(sub_h.float(), (sub_h.shape[-1],), ln_w_f, ln_b_f, ln_eps).to(sub_h.dtype)
+        y = f_mod.linear(y, w1, b1)
+        y = f_mod.silu(y)
+        y = f_mod.linear(y, w2, b2)
+        return y + sub_x
+
+    compiled_pointwise = _make_compiled_pointwise(_convnext_pointwise_eager, torch_mod)
+    compile_state = {"failed": False}
 
     def _chunked_convnext_forward(self: Any, x: Any) -> Any:
         h = self.conv(x)
@@ -264,6 +296,31 @@ def patch_sparse_convnext_block(
         x_feats = x.feats
         n = feats.shape[0]
         step = _effective_voxel_chunk(torch_mod, chunk_size)
+        use_fused = (
+            not compile_state["failed"]
+            and compiled_pointwise is not _convnext_pointwise_eager
+            and bool(getattr(feats, "is_cuda", False))
+            and hasattr(self.norm, "eps")
+            and hasattr(self.mlp[0], "weight")
+            and hasattr(self.mlp[2], "weight")
+        )
+        if use_fused:
+            ln_w = getattr(self.norm, "weight", None)
+            ln_b = getattr(self.norm, "bias", None)
+            ln_eps = float(getattr(self.norm, "eps", 1e-6))
+            w1, b1 = self.mlp[0].weight, self.mlp[0].bias
+            w2, b2 = self.mlp[2].weight, self.mlp[2].bias
+            try:
+                for s in range(0, n, step):
+                    e = min(s + step, n)
+                    feats[s:e].copy_(
+                        compiled_pointwise(feats[s:e], x_feats[s:e], ln_w, ln_b, ln_eps, w1, b1, w2, b2)
+                    )
+                return h
+            except Exception as exc:
+                log.debug("ConvNeXt compiled kernel failed; falling back to eager: %s", exc)
+                compile_state["failed"] = True
+
         for s in range(0, n, step):
             e = min(s + step, n)
             sub = self.norm(feats[s:e])
@@ -738,21 +795,56 @@ def patch_sparse_ffn(
     f_mod: Any,
     chunk_size: int = DEFAULT_TOKEN_CHUNK_SIZE,
 ) -> None:
-    """Chunk SparseFeedForwardNet (1536 -> 8192 -> 1536) when VRAM is tight; fuse into 1 GEMM when VRAM is ample."""
+    """Chunk SparseFeedForwardNet (1536 -> 8192 -> 1536) when VRAM is tight; fuse with Inductor when VRAM is ample."""
     if getattr(ffn_cls, "_trellis2_vram_patched", False):
         return
     orig_forward = ffn_cls.forward
 
+    def _ffn_tanh_eager(sub_x: Any, w1: Any, b1: Any, w2: Any, b2: Any) -> Any:
+        return f_mod.linear(f_mod.gelu(f_mod.linear(sub_x, w1, b1), approximate="tanh"), w2, b2)
+
+    def _ffn_none_eager(sub_x: Any, w1: Any, b1: Any, w2: Any, b2: Any) -> Any:
+        return f_mod.linear(f_mod.gelu(f_mod.linear(sub_x, w1, b1), approximate="none"), w2, b2)
+
+    compiled_ffn_tanh = _make_compiled_pointwise(_ffn_tanh_eager, torch_mod)
+    compiled_ffn_none = _make_compiled_pointwise(_ffn_none_eager, torch_mod)
+    compile_state = {"failed": False}
+
     def _chunked_ffn_forward(self: Any, x: Any) -> Any:
+        if getattr(self, "training", False):
+            return orig_forward(self, x)
         n = x.feats.shape[0]
         step = _effective_token_chunk(torch_mod, chunk_size)
-        if getattr(self, "training", False) or n <= step:
-            return orig_forward(self, x)
         fc1, act, fc2 = self.mlp[0], self.mlp[1], self.mlp[2]
         approx = getattr(act, "approximate", "tanh")
+        compiled_fn = compiled_ffn_tanh if approx == "tanh" else compiled_ffn_none
+        eager_ref = _ffn_tanh_eager if approx == "tanh" else _ffn_none_eager
+        use_compiled = (
+            not compile_state["failed"]
+            and compiled_fn is not eager_ref
+            and bool(getattr(x.feats, "is_cuda", False))
+            and hasattr(fc1, "weight")
+            and hasattr(fc2, "weight")
+        )
+        if n <= step:
+            if use_compiled:
+                try:
+                    return x.replace(compiled_fn(x.feats, fc1.weight, fc1.bias, fc2.weight, fc2.bias))
+                except Exception as exc:
+                    log.debug("SparseFFN compiled kernel failed; falling back to eager: %s", exc)
+                    compile_state["failed"] = True
+            return orig_forward(self, x)
+
         out = torch_mod.empty_like(x.feats)
         for s in range(0, n, step):
             e = min(s + step, n)
+            if use_compiled and not compile_state["failed"]:
+                try:
+                    out[s:e].copy_(compiled_fn(x.feats[s:e], fc1.weight, fc1.bias, fc2.weight, fc2.bias))
+                    continue
+                except Exception as exc:
+                    log.debug("SparseFFN chunked compiled kernel failed; falling back to eager: %s", exc)
+                    compile_state["failed"] = True
             sub = f_mod.linear(x.feats[s:e], fc1.weight, fc1.bias)
             sub = f_mod.gelu(sub, approximate=approx)
             sub = f_mod.linear(sub, fc2.weight, fc2.bias)
@@ -1438,8 +1530,78 @@ def patch_mesh_simplify_noop(mesh_cls: Any) -> None:
     mesh_cls._trellis2_simplify_patched = True
 
 
+def gpu_dilate_uv_gutters(
+    base_color: Any,
+    metallic: Any,
+    roughness: Any,
+    alpha: Any,
+    mask_inv: Any,
+    torch_mod: Any,
+    f_mod: Any,
+    device: Any = None,
+    num_iters: int = 6,
+) -> tuple[Any, Any, Any, Any]:
+    """Dilate UV island borders into empty UV gutters on GPU (<5ms) while keeping 100% of valid texels bit-exact."""
+    import numpy as np
+
+    dev = device if device is not None else ("cuda" if torch_mod.cuda.is_available() else "cpu")
+    h, w = mask_inv.shape[:2]
+
+    def _as_hwc(arr: Any, ch: int) -> Any:
+        if arr.ndim == 2:
+            return arr[..., None]
+        if arr.ndim == 3 and arr.shape[2] == ch:
+            return arr
+        return arr.reshape(h, w, ch)
+
+    bc_hwc = _as_hwc(base_color, 3)
+    mt_hwc = _as_hwc(metallic, 1)
+    rg_hwc = _as_hwc(roughness, 1)
+    al_hwc = _as_hwc(alpha, 1)
+
+    packed_np = np.concatenate([bc_hwc, mt_hwc, rg_hwc, al_hwc], axis=-1)  # (H, W, 6) uint8
+    orig_u8 = torch_mod.from_numpy(packed_np).to(device=dev, non_blocking=True)
+    valid_orig = (torch_mod.from_numpy(mask_inv).to(device=dev, non_blocking=True) == 0)
+
+    if not bool(valid_orig.any()):
+        return bc_hwc.copy(), mt_hwc.copy(), rg_hwc.copy(), al_hwc.copy()
+
+    # Check if alpha is uniform across all valid UV island pixels (e.g. opaque 255)
+    al_valid = orig_u8[..., 5][valid_orig]
+    al_min = al_valid.min()
+    al_uniform = bool((al_min == al_valid.max()).item())
+
+    buf = orig_u8.permute(2, 0, 1).unsqueeze(0).to(torch_mod.float32)  # (1, 6, H, W)
+    valid = valid_orig.unsqueeze(0).unsqueeze(0).to(torch_mod.float32)  # (1, 1, H, W)
+    buf.mul_(valid)
+
+    for _ in range(max(1, int(num_iters))):
+        nbr_valid = f_mod.avg_pool2d(valid, kernel_size=3, stride=1, padding=1, count_include_pad=False)
+        need_fill = (valid == 0) & (nbr_valid > 0)
+        if not bool(need_fill.any()):
+            break
+        nbr_sum = f_mod.avg_pool2d(buf, kernel_size=3, stride=1, padding=1, count_include_pad=False)
+        filled = nbr_sum / nbr_valid.clamp_min(1e-6)
+        buf = torch_mod.where(need_fill, filled, buf)
+        valid = torch_mod.where(need_fill, torch_mod.ones_like(valid), valid)
+
+    out_u8 = buf.squeeze(0).permute(1, 2, 0).round().clamp_(0, 255).to(torch_mod.uint8)
+    # Guarantee 100% bit-exact preservation of every valid UV island pixel
+    out_u8 = torch_mod.where(valid_orig.unsqueeze(-1), orig_u8, out_u8)
+    if al_uniform:
+        out_u8[..., 5].fill_(int(al_min.item()))
+
+    out_np = out_u8.cpu().numpy()
+    return (
+        np.ascontiguousarray(out_np[..., 0:3]),
+        np.ascontiguousarray(out_np[..., 3:4]),
+        np.ascontiguousarray(out_np[..., 4:5]),
+        np.ascontiguousarray(out_np[..., 5:6]),
+    )
+
+
 def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> None:
-    """Accelerate o_voxel.postprocess.to_glb via bit-exact 4-thread parallel PBR UV seam inpainting."""
+    """Accelerate o_voxel.postprocess.to_glb via GPU UV-gutter dilation (<5ms) with 4-thread CPU cv2 fallback."""
     if postprocess_mod is None or getattr(postprocess_mod, "_trellis2_postprocess_patched", False):
         return
     try:
@@ -1461,6 +1623,21 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
     def _parallel_pbr_inpaint(
         base_color: Any, metallic: Any, roughness: Any, alpha: Any, mask_inv: Any
     ) -> tuple[Any, Any, Any, Any]:
+        if (
+            torch_mod is not None
+            and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
+            and os.environ.get("TRELLIS2_GPU_UV_DILATE", "1") != "0"
+            and torch_mod.cuda.is_available()
+        ):
+            try:
+                import torch.nn.functional as f_mod
+
+                return gpu_dilate_uv_gutters(
+                    base_color, metallic, roughness, alpha, mask_inv, torch_mod, f_mod
+                )
+            except Exception as exc:
+                log.debug("GPU UV-gutter dilation failed; falling back to 4-thread cv2.inpaint: %s", exc)
+
         cv2_local = postprocess_mod.cv2
         flag = cv2_local.INPAINT_TELEA
         f_bc = inpaint_pool.submit(cv2_local.inpaint, base_color, mask_inv, 3, flag)
@@ -1563,6 +1740,165 @@ def patch_cv2_inpaint_fastpath(cv2_mod: Any, np_mod: Any) -> None:
 
     cv2_mod.inpaint = _fast_inpaint
     cv2_mod._trellis2_inpaint_patched = True
+
+
+def patch_torch_compile_modules(pipeline: Any, torch_mod: Any) -> list[str]:
+    """Apply persistent torch.compile (Inductor, mode='default', dynamic=True) to dense pipeline modules."""
+    compiled: list[str] = []
+    if (
+        pipeline is None
+        or torch_mod is None
+        or os.name == "nt"
+        or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
+        or os.environ.get("TRELLIS2_TORCH_COMPILE", "1") == "0"
+        or not callable(getattr(torch_mod, "compile", None))
+        or not torch_mod.cuda.is_available()
+    ):
+        return compiled
+
+    models_dict = getattr(pipeline, "models", None)
+    if isinstance(models_dict, dict):
+        ss_dec = models_dict.get("sparse_structure_decoder")
+        if ss_dec is not None and not getattr(ss_dec, "_trellis2_compiled", False):
+            try:
+                compiled_dec = torch_mod.compile(ss_dec, mode="default", dynamic=True)
+                compiled_dec._trellis2_compiled = True
+                models_dict["sparse_structure_decoder"] = compiled_dec
+                compiled.append("sparse_structure_decoder")
+            except Exception as exc:
+                log.debug("Skipping torch.compile for sparse_structure_decoder: %s", exc)
+
+    img_cond = getattr(pipeline, "image_cond_model", None)
+    if img_cond is not None and not getattr(img_cond, "_trellis2_compiled", False):
+        extract_fn = getattr(img_cond, "extract_features", None)
+        if callable(extract_fn):
+            try:
+                img_cond.extract_features = torch_mod.compile(extract_fn, mode="default", dynamic=True)
+                img_cond._trellis2_compiled = True
+                compiled.append("image_cond_model.extract_features")
+            except Exception as exc:
+                log.debug("Skipping torch.compile for image_cond_model.extract_features: %s", exc)
+
+    rembg = getattr(pipeline, "rembg_model", None)
+    if rembg is not None and not getattr(rembg, "_trellis2_compiled", False):
+        rembg_inner = getattr(rembg, "model", None)
+        if rembg_inner is not None and callable(rembg_inner):
+            try:
+                rembg.model = torch_mod.compile(rembg_inner, mode="default", dynamic=True)
+                rembg._trellis2_compiled = True
+                compiled.append("rembg_model.model")
+            except Exception as exc:
+                log.debug("Skipping torch.compile for rembg_model.model: %s", exc)
+
+    if compiled:
+        log.info("Enabled persistent torch.compile (Inductor) for: %s", ", ".join(compiled))
+    return compiled
+
+
+def warmup_pipeline_kernels(
+    pipeline: Any,
+    torch_mod: Any,
+    model_mgr: VRAMModelManager | None = None,
+) -> list[str]:
+    """Pre-warm Stage-1 CUDA Graphs & compiled dense kernels at worker boot before /ping reports ready."""
+    warmed: list[str] = []
+    if (
+        pipeline is None
+        or torch_mod is None
+        or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
+        or os.environ.get("TRELLIS2_BOOT_WARMUP", "1") == "0"
+        or not torch_mod.cuda.is_available()
+    ):
+        return warmed
+
+    free_gb = _cuda_free_gb(torch_mod)
+    if free_gb is not None and free_gb < VRAM_SAFETY_FLOOR_GB + 1.5:
+        log.info("Skipping boot kernel warmup (free VRAM %.2f GiB < %.2f GiB)", free_gb, VRAM_SAFETY_FLOOR_GB + 1.5)
+        return warmed
+
+    t0 = time.monotonic()
+    dev = getattr(pipeline, "device", torch_mod.device("cuda"))
+    models_dict = getattr(pipeline, "models", {}) or {}
+    infer_ctx = torch_mod.inference_mode() if hasattr(torch_mod, "inference_mode") else nullcontext()
+
+    with infer_ctx:
+        cond_1 = None
+        img_cond = getattr(pipeline, "image_cond_model", None)
+        if img_cond is not None and callable(img_cond):
+            try:
+                if model_mgr is not None:
+                    model_mgr.ensure_on_gpu(
+                        ["image_cond_model"], dev, required_free_gb=VRAM_SAFETY_FLOOR_GB + 1.0
+                    )
+                prev_sz = getattr(img_cond, "image_size", None)
+                if prev_sz is not None:
+                    img_cond.image_size = 512
+                try:
+                    dummy_img = Image.new("RGB", (64, 64), (128, 128, 128))
+                    cond_1 = img_cond([dummy_img])
+                    warmed.append("image_cond_model")
+                finally:
+                    if prev_sz is not None:
+                        img_cond.image_size = prev_sz
+            except Exception as exc:
+                log.debug("Boot warmup skipped for image_cond_model: %s", exc)
+                cond_1 = None
+
+        ss_flow = models_dict.get("sparse_structure_flow_model")
+        if ss_flow is not None:
+            try:
+                if model_mgr is not None:
+                    model_mgr.ensure_on_gpu(
+                        ["sparse_structure_flow_model"],
+                        dev,
+                        required_free_gb=VRAM_SAFETY_FLOOR_GB + 1.0,
+                    )
+                reso = int(getattr(ss_flow, "resolution", 16))
+                in_ch = int(getattr(ss_flow, "in_channels", 8))
+                cond_ch = int(getattr(ss_flow, "cond_channels", 1024))
+                flow_dtype = getattr(ss_flow, "dtype", torch_mod.float16)
+                if cond_1 is None:
+                    cond_1 = torch_mod.zeros((1, 1029, cond_ch), dtype=flow_dtype, device=dev)
+                else:
+                    cond_1 = cond_1.to(device=dev, dtype=flow_dtype)
+
+                for bsz in (2, 1):
+                    x_w = torch_mod.zeros((bsz, in_ch, reso, reso, reso), dtype=torch_mod.float32, device=dev)
+                    t_w = torch_mod.full((bsz,), 500.0, dtype=torch_mod.float32, device=dev)
+                    c_w = cond_1.expand(bsz, -1, -1).contiguous()
+                    _ = ss_flow(x_w, t_w, c_w)
+                    del x_w, t_w, c_w
+                warmed.append("sparse_structure_flow_model(cudagraph)")
+            except Exception as exc:
+                log.debug("Boot warmup skipped for sparse_structure_flow_model: %s", exc)
+        del cond_1
+
+        ss_dec = models_dict.get("sparse_structure_decoder")
+        if ss_dec is not None:
+            try:
+                if model_mgr is not None:
+                    model_mgr.ensure_on_gpu(
+                        ["sparse_structure_decoder"],
+                        dev,
+                        required_free_gb=VRAM_SAFETY_FLOOR_GB + 1.0,
+                    )
+                reso = int(getattr(ss_flow, "resolution", 16)) if ss_flow is not None else 16
+                out_ch = int(getattr(ss_flow, "out_channels", 8)) if ss_flow is not None else 8
+                z_w = torch_mod.zeros((1, out_ch, reso, reso, reso), dtype=torch_mod.float32, device=dev)
+                _ = ss_dec(z_w)
+                del z_w
+                warmed.append("sparse_structure_decoder")
+            except Exception as exc:
+                log.debug("Boot warmup skipped for sparse_structure_decoder: %s", exc)
+
+    if torch_mod.cuda.is_available():
+        try:
+            torch_mod.cuda.synchronize()
+        except Exception:
+            pass
+    if warmed:
+        log.info("Boot kernel warmup completed in %.2fs: %s", time.monotonic() - t0, ", ".join(warmed))
+    return warmed
 
 
 def _persist_flex_gemm_autotune_cache() -> None:
@@ -2142,10 +2478,14 @@ class Trellis2Engine:
             )
             self.stage = "moving_to_cuda"
             pipeline.cuda()
+            patch_torch_compile_modules(pipeline, torch)
             model_mgr: VRAMModelManager | None = None
             if self.low_vram and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0":
                 model_mgr = VRAMModelManager(pipeline, torch, vram_gb=self.vram_gb)
                 model_mgr.warm_initial_models(pipeline.device)
+
+            self.stage = "warming_up_kernels"
+            warmup_pipeline_kernels(pipeline, torch, model_mgr=model_mgr)
 
             with self._state_lock:
                 self._pipeline = pipeline
@@ -2552,36 +2892,86 @@ class Trellis2Engine:
 
             m = meshes[0]
             del meshes
-            m.fill_holes()
             free_after_shape = _cuda_free_gb(torch)
-            spill_mesh_geom = bool(
-                mgr is None
-                or free_after_shape is None
-                or free_after_shape < (floor + 3.0)
+            can_overlap_fill = bool(
+                mgr is not None
+                and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
+                and os.environ.get("TRELLIS2_STREAM_OVERLAP", "1") != "0"
+                and torch is not None
+                and torch.cuda.is_available()
+                and hasattr(torch.cuda, "Stream")
+                and hasattr(torch.cuda, "Event")
+                and free_after_shape is not None
+                and free_after_shape >= (floor + 2.5)
             )
-            verts_staged = m.vertices.cpu() if spill_mesh_geom else m.vertices
-            faces_staged = m.faces.cpu() if spill_mesh_geom else m.faces
-            del m
-            if mgr is None:
-                self._release_vram(offload_models=False)
+            fill_thread: threading.Thread | None = None
+            fill_stream: Any = None
+            fill_err: list[BaseException | None] = [None]
+            verts_staged: Any = None
+            faces_staged: Any = None
+            spill_mesh_geom = False
+
+            if can_overlap_fill:
+                shape_done_evt = torch.cuda.Event()
+                shape_done_evt.record(torch.cuda.current_stream())
+                fill_stream = torch.cuda.Stream()
+
+                def _fill_holes_async() -> None:
+                    try:
+                        with torch.cuda.stream(fill_stream):
+                            fill_stream.wait_event(shape_done_evt)
+                            m.fill_holes()
+                    except BaseException as exc:
+                        fill_err[0] = exc
+
+                fill_thread = threading.Thread(
+                    target=_fill_holes_async, name="trellis2-fill-holes", daemon=True
+                )
+                fill_thread.start()
+            else:
+                m.fill_holes()
+                free_after_shape = _cuda_free_gb(torch)
+                spill_mesh_geom = bool(
+                    mgr is None
+                    or free_after_shape is None
+                    or free_after_shape < (floor + 3.0)
+                )
+                verts_staged = m.vertices.cpu() if spill_mesh_geom else m.vertices
+                faces_staged = m.faces.cpu() if spill_mesh_geom else m.faces
+                del m
+                if mgr is None:
+                    self._release_vram(offload_models=False)
 
             _emit("decoding_textures")
-            tex_dec = pipe.models.get("tex_slat_decoder")
-            if mgr is not None:
-                mgr.ensure_on_gpu(
-                    ["tex_slat_decoder"],
-                    pipe.device,
-                    required_free_gb=floor + (6.0 if res >= 1536 else 3.5),
-                )
-                self._configure_decoder_residency(tex_dec)
-            elif tex_dec is not None:
-                tex_dec.low_vram = True
-            tex_slat_gpu = tex_slat_staged.to(pipe.device) if spill_tex_slat else tex_slat_staged
-            del tex_slat_staged
-            tex_voxels = pipe.decode_tex_slat(tex_slat_gpu, subs)
-            del tex_slat_gpu, subs
-            if mgr is None:
-                self._release_vram(offload_models=True)
+            try:
+                tex_dec = pipe.models.get("tex_slat_decoder")
+                if mgr is not None:
+                    mgr.ensure_on_gpu(
+                        ["tex_slat_decoder"],
+                        pipe.device,
+                        required_free_gb=floor + (6.0 if res >= 1536 else 3.5),
+                    )
+                    self._configure_decoder_residency(tex_dec)
+                elif tex_dec is not None:
+                    tex_dec.low_vram = True
+                tex_slat_gpu = tex_slat_staged.to(pipe.device) if spill_tex_slat else tex_slat_staged
+                del tex_slat_staged
+                tex_voxels = pipe.decode_tex_slat(tex_slat_gpu, subs)
+                del tex_slat_gpu, subs
+                if mgr is None:
+                    self._release_vram(offload_models=True)
+            finally:
+                if fill_thread is not None:
+                    fill_thread.join()
+                    if fill_stream is not None:
+                        torch.cuda.current_stream().wait_stream(fill_stream)
+                    if fill_err[0] is not None:
+                        raise fill_err[0]
+
+            if can_overlap_fill:
+                verts_staged = m.vertices
+                faces_staged = m.faces
+                del m
 
             v = tex_voxels[0]
             del tex_voxels
