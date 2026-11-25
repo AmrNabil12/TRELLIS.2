@@ -39,6 +39,30 @@ def _configure_persistent_kernel_caches() -> None:
     os.environ.setdefault("FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE", "1")
 
 
+def _flush_flex_gemm_autotune_cache() -> None:
+    """Best-effort immediate flush of FlexGEMM Triton autotune cache to persistent storage."""
+    try:
+        import flex_gemm.ops.spconv as _spconv  # type: ignore[import-not-found]
+    except Exception:
+        return
+    for fn_name in ("save_autotune_cache", "dump_autotune_cache"):
+        fn = getattr(_spconv, fn_name, None)
+        if callable(fn):
+            try:
+                fn()
+                return
+            except Exception:
+                pass
+    try:
+        from flex_gemm.kernels.triton.spconv import config as _triton_cfg  # type: ignore[import-not-found]
+
+        save_fn = getattr(_triton_cfg, "save_autotune_cache", None)
+        if callable(save_fn):
+            save_fn()
+    except Exception:
+        pass
+
+
 import gc
 import inspect
 import io
@@ -87,6 +111,8 @@ FAST_VOXEL_CHUNK_HIGH = 1_048_576
 FAST_VOXEL_CHUNK_ULTRA = 2_097_152
 DEFAULT_TOKEN_CHUNK_SIZE = max(4_096, int(os.environ.get("TRELLIS2_TOKEN_CHUNK", "16384")))
 FAST_TOKEN_CHUNK_HIGH = 262_144
+DEFAULT_MAX_NUM_TOKENS = max(16_384, int(os.environ.get("TRELLIS2_MAX_NUM_TOKENS", "65536")))
+BATCH_CFG_MAX_SPARSE_TOKENS = max(4_096, int(os.environ.get("TRELLIS2_BATCH_CFG_MAX_TOKENS", "24576")))
 OOM_FALLBACK_CHAIN: dict[str, str] = {
     "1536_cascade": "1024_cascade",
     "1024_cascade": "1024",
@@ -244,12 +270,18 @@ def patch_layernorm32(
 
 
 def _make_compiled_pointwise(fn: Callable[..., Any], torch_mod: Any) -> Callable[..., Any]:
-    """Compile a pointwise CUDA kernel once with dynamic shapes and automatic eager fallback."""
+    """Compile a pointwise CUDA kernel when explicitly opted in (TRELLIS2_COMPILE_POINTWISE=1).
+
+    Disabled by default on serverless workers because compiling multiple SparseConvNeXt channel
+    widths (1024/512/256/128) on 6 vCPUs adds ~55s of cold Inductor overhead inside upsample_coords,
+    whereas eager cuBLAS GEMMs + inplace SiLU already saturate Tensor Cores with 0s compile latency.
+    """
     if (
         torch_mod is None
         or os.name == "nt"
         or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
         or os.environ.get("TRELLIS2_TORCH_COMPILE", "1") == "0"
+        or os.environ.get("TRELLIS2_COMPILE_POINTWISE", "0") != "1"
         or not callable(getattr(torch_mod, "compile", None))
         or not torch_mod.cuda.is_available()
     ):
@@ -985,6 +1017,35 @@ def patch_cross_attention_kv_cache(
         orig_sparse_fwd = sparse_mha_cls.forward
 
         def _cached_sparse_mha_forward(self: Any, x: Any, context: Any = None) -> Any:
+            s_attn = (
+                sparse_attn_fn_holder.sparse_scaled_dot_product_attention
+                if sparse_attn_fn_holder is not None
+                else getattr(self, "_sparse_sdpa_fn", None)
+            )
+            if (
+                getattr(self, "_type", None) == "self"
+                and getattr(self, "attn_mode", None) == "full"
+                and (getattr(self, "qk_rms_norm", False) or getattr(self, "use_rope", False))
+                and not getattr(self, "training", False)
+                and s_attn is not None
+                and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
+            ):
+                # Avoid repacking [q, k, v] via torch.stack (~400-471 MB per block x 30 blocks x 21 passes)
+                # by invoking flash_attn_varlen_func(q, k, v) directly (bit-identical FlashAttention-2 math).
+                qkv = self._linear(self.to_qkv, x)
+                qkv = self._fused_pre(qkv, num_fused=3)
+                q, k, v = qkv.unbind(dim=-3)
+                del qkv
+                if self.qk_rms_norm:
+                    q = self.q_rms_norm(q)
+                    k = self.k_rms_norm(k)
+                if self.use_rope:
+                    q, k = self.rope(q, k)
+                h = s_attn(q, k, v)
+                del q, k, v
+                h = self._reshape_chs(h, (-1,))
+                return self._linear(self.to_out, h)
+
             if (
                 getattr(self, "_type", None) != "cross"
                 or not getattr(self, "_kv_cache_enabled", False)
@@ -1183,6 +1244,29 @@ def patch_cfg_sampler_batching(
                     pred_neg = pred_2[1:2]
                 elif sparse_tensor_cls is not None and isinstance(x_t, sparse_tensor_cls):
                     m = x_t.feats.shape[0]
+                    max_batch_tokens = max(
+                        1,
+                        int(
+                            os.environ.get(
+                                "TRELLIS2_BATCH_CFG_MAX_TOKENS",
+                                str(BATCH_CFG_MAX_SPARSE_TOKENS),
+                            )
+                        ),
+                    )
+                    if m > max_batch_tokens:
+                        # Above ~24K tokens (1408^3/1536^3), B=1 already saturates RTX 4090 Tensor Cores;
+                        # sequential CFG matches wall-clock speed while saving ~3.5-4.0 GiB activation VRAM.
+                        return orig_cfg_inference(
+                            self,
+                            model,
+                            x_t,
+                            t,
+                            cond,
+                            neg_cond,
+                            guidance_strength,
+                            guidance_rescale=guidance_rescale,
+                            **kwargs,
+                        )
                     c_in = x_t.feats.shape[1]
                     proto_2 = ctx_state.get("proto_2")
                     if proto_2 is None or ctx_state.get("proto_m") != m:
@@ -2777,7 +2861,9 @@ class Trellis2Engine:
                 res = 1024
             elif pipeline_type in ("1024_cascade", "1536_cascade"):
                 target_res = 1536 if pipeline_type == "1536_cascade" else 1024
-                max_num_tokens = int(os.environ.get("TRELLIS2_MAX_NUM_TOKENS", "49152"))
+                max_num_tokens = int(
+                    os.environ.get("TRELLIS2_MAX_NUM_TOKENS", str(DEFAULT_MAX_NUM_TOKENS))
+                )
 
                 _emit("sampling_shape_512")
                 t_st = time.monotonic()
@@ -2804,21 +2890,24 @@ class Trellis2Engine:
                 t_st = time.monotonic()
                 shape_dec = pipe.models["shape_slat_decoder"]
                 if mgr is not None:
-                    self._configure_decoder_residency(shape_dec)
+                    # Evict stale 512/conditioning models FIRST so _configure_decoder_residency sees
+                    # post-eviction free VRAM (>= floor + 4.5 GiB) and keeps shape_dec 100% GPU-resident.
                     mgr.ensure_on_gpu(
                         ["shape_slat_decoder"],
                         pipe.device,
-                        required_free_gb=floor + 2.0,
+                        required_free_gb=floor + 4.5,
                         protected=["shape_slat_flow_model_1024"],
                     )
+                    self._configure_decoder_residency(shape_dec)
                     mgr.prefetch_async(
                         ["shape_slat_flow_model_1024", "tex_slat_flow_model_1024"],
                         pipe.device,
-                        min_free_after_gb=floor + 2.0,
+                        min_free_after_gb=floor + 4.5,
                     )
                 else:
                     shape_dec.low_vram = True
                 hr_coords = shape_dec.upsample(slat_lr, upsample_times=4)
+                _flush_flex_gemm_autotune_cache()
                 del slat_lr
                 if mgr is None:
                     if hasattr(shape_dec, "cpu"):
@@ -2845,6 +2934,13 @@ class Trellis2Engine:
                                 max_num_tokens,
                                 hr_unique.shape[0],
                             )
+                        else:
+                            log.info(
+                                "Cascade target resolution %d achieved (tokens=%d <= max_num_tokens=%d)",
+                                hr_resolution,
+                                hr_unique.shape[0],
+                                max_num_tokens,
+                            )
                         break
                     hr_resolution -= 128
                 del hr_coords
@@ -2858,17 +2954,20 @@ class Trellis2Engine:
                     else _move_cond_dict(cond_1024_saved, pipe.device, non_blocking=True)
                 )
                 del cond_1024_saved
+                hr_flow_headroom_gb = floor + (4.5 if res >= 1536 else 2.0)
                 _emit("sampling_shape_hr")
                 t_st = time.monotonic()
                 if mgr is not None:
                     mgr.ensure_on_gpu(
                         ["shape_slat_flow_model_1024"],
                         pipe.device,
-                        required_free_gb=floor + 2.0,
+                        required_free_gb=hr_flow_headroom_gb,
                         protected=["tex_slat_flow_model_1024"],
                     )
                     mgr.prefetch_async(
-                        ["tex_slat_flow_model_1024"], pipe.device, min_free_after_gb=floor + 2.5
+                        ["tex_slat_flow_model_1024"],
+                        pipe.device,
+                        min_free_after_gb=hr_flow_headroom_gb + 0.5,
                     )
                 shape_slat = pipe.sample_shape_slat(
                     cond_1024, pipe.models["shape_slat_flow_model_1024"], hr_unique, {}
@@ -2884,13 +2983,13 @@ class Trellis2Engine:
                     mgr.ensure_on_gpu(
                         ["tex_slat_flow_model_1024"],
                         pipe.device,
-                        required_free_gb=floor + 2.0,
+                        required_free_gb=hr_flow_headroom_gb,
                         protected=["shape_slat_decoder", "tex_slat_decoder"],
                     )
                     mgr.prefetch_async(
                         ["shape_slat_decoder", "tex_slat_decoder"],
                         pipe.device,
-                        min_free_after_gb=floor + 2.5,
+                        min_free_after_gb=hr_flow_headroom_gb + 0.5,
                     )
                 tex_slat = pipe.sample_tex_slat(
                     cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, {}
@@ -2931,6 +3030,7 @@ class Trellis2Engine:
                     ["tex_slat_decoder"], pipe.device, min_free_after_gb=decode_headroom_gb
                 )
             meshes, subs = pipe.decode_shape_slat(shape_slat, res)
+            _flush_flex_gemm_autotune_cache()
             del shape_slat
             if mgr is None:
                 self._release_vram(offload_models=True)
@@ -3100,12 +3200,19 @@ class Trellis2Engine:
                         image, params, pipeline_type, on_stage=on_stage
                     )
                 else:
-                    mesh = self._pipeline.run(
-                        image,
-                        seed=params.seed,
-                        preprocess_image=params.preprocess_image,
-                        pipeline_type=pipeline_type,
-                    )[0]
+                    run_kwargs: dict[str, Any] = {
+                        "seed": params.seed,
+                        "preprocess_image": params.preprocess_image,
+                        "pipeline_type": pipeline_type,
+                    }
+                    try:
+                        if "max_num_tokens" in inspect.signature(self._pipeline.run).parameters:
+                            run_kwargs["max_num_tokens"] = int(
+                                os.environ.get("TRELLIS2_MAX_NUM_TOKENS", str(DEFAULT_MAX_NUM_TOKENS))
+                            )
+                    except (TypeError, ValueError):
+                        pass
+                    mesh = self._pipeline.run(image, **run_kwargs)[0]
 
                 # Ensure >= (4 GiB floor + 2.5 GiB = 6.5 GiB) free for cuBVH/CuMesh/nvdiffrast baking
                 if self._model_mgr is not None:
