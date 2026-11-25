@@ -21,10 +21,16 @@ fi
 if [[ -n "${STORAGE_ROOT}" ]]; then
     export HF_HOME="${HF_HOME:-${STORAGE_ROOT}/hf_cache}"
     export TRELLIS2_JOBS_DIR="${TRELLIS2_JOBS_DIR:-${STORAGE_ROOT}/jobs}"
-    mkdir -p "${TRELLIS2_JOBS_DIR}"
+    export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${STORAGE_ROOT}/triton_cache}"
+    export FLEX_GEMM_AUTOTUNE_CACHE_PATH="${FLEX_GEMM_AUTOTUNE_CACHE_PATH:-${STORAGE_ROOT}/flex_gemm_autotune_cache.json}"
+    mkdir -p "${TRELLIS2_JOBS_DIR}" "${TRITON_CACHE_DIR}"
 else
     export HF_HOME="${HF_HOME:-/root/.cache/huggingface}"
+    export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/.cache/triton}"
+    export FLEX_GEMM_AUTOTUNE_CACHE_PATH="${FLEX_GEMM_AUTOTUNE_CACHE_PATH:-/root/.cache/flex_gemm_autotune_cache.json}"
+    mkdir -p "${TRITON_CACHE_DIR}"
 fi
+export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
 mkdir -p "${HF_HOME}"
 
 if [[ -z "${HF_TOKEN:-}" ]] && [[ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
@@ -34,5 +40,7 @@ if [[ -z "${HF_TOKEN:-}" ]] && [[ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
     echo "    - briaai/RMBG-2.0 (requires HF access acceptance)" >&2
     echo "  If weights are not already cached in ${HF_HOME}, startup loading will fail without HF_TOKEN." >&2
 fi
+
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
 
 exec uvicorn server:app --host 0.0.0.0 --port "${PORT:-8000}" --workers 1

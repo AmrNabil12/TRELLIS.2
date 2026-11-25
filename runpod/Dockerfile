@@ -109,10 +109,12 @@ RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 
 ENV PYTHONPATH=/opt/TRELLIS.2:/app \
     OPENCV_IO_ENABLE_OPENEXR=1 \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8 \
+    FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TRELLIS2_MODEL_ID=microsoft/TRELLIS.2-4B \
     TRELLIS2_LOW_VRAM=auto \
+    TRELLIS2_FAST_VRAM=1 \
     PORT=8000 \
     PORT_HEALTH=8000
 
