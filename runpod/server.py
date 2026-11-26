@@ -691,6 +691,16 @@ def _chunked_subm_conv3d_slices_to_cpu(
     spatial_shape = torch_mod.Size([*x.shape, *x.spatial_shape])
     staged_slices: list[tuple[int, int, Any]] = []
 
+    spconv_mod_ref: Any = None
+    saved_spconv_algo: Any = None
+    if is_cuda:
+        try:
+            import flex_gemm.ops.spconv as spconv_mod_ref  # type: ignore[import-not-found]
+
+            saved_spconv_algo = getattr(spconv_mod_ref, "ALGORITHM", None)
+        except Exception:
+            spconv_mod_ref = None
+
     try:
         c0 = 0
         while c0 < co:
@@ -744,6 +754,9 @@ def _chunked_subm_conv3d_slices_to_cpu(
     except BaseException:
         _release_staged_slices(staged_slices)
         raise
+    finally:
+        if spconv_mod_ref is not None and saved_spconv_algo is not None:
+            spconv_mod_ref.ALGORITHM = saved_spconv_algo
 
     return staged_slices
 
@@ -1220,6 +1233,8 @@ def patch_flex_gemm_neighbor_cache(
             raise NotImplementedError("CPU version of hashmap is not implemented")
 
         ratio = float(getattr(spconv_pkg, "HASHMAP_RATIO", 2.0))
+        if int(coords.shape[0]) >= 35_000_000 and ratio > 1.5:
+            ratio = 1.5
         ratios_to_try = [ratio]
         if ratio > 1.5:
             ratios_to_try.append(1.5)
@@ -1298,6 +1313,7 @@ def patch_flex_gemm_neighbor_cache(
                 valid_signal_o=valid_signal_o,
             )
 
+        post_oom = False
         try:
             gray_code, sorted_idx = (
                 kernels_mod.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1_no_bwd(
@@ -1307,12 +1323,28 @@ def patch_flex_gemm_neighbor_cache(
         except RuntimeError as exc:
             if not _is_oom(exc):
                 raise
+            _clear_oom_traceback_frames(exc)
+            post_oom = True
+        if post_oom:
             _empty_cuda_cache()
-            gray_code, sorted_idx = (
-                kernels_mod.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1_no_bwd(
-                    neighbor_map
+            try:
+                gray_code, sorted_idx = (
+                    kernels_mod.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1_no_bwd(
+                        neighbor_map
+                    )
                 )
-            )
+            except RuntimeError as exc2:
+                implicit_alg = getattr(alg_cls, "IMPLICIT_GEMM", None)
+                if not _is_oom(exc2) or implicit_alg is None:
+                    raise
+                _clear_oom_traceback_frames(exc2)
+                _empty_cuda_cache()
+                log.warning(
+                    "FlexGEMM masked post-process OOM at N=%d; switching current conv to IMPLICIT_GEMM (saves ~1.8 GiB sort/mask buffers)",
+                    int(coords.shape[0]),
+                )
+                spconv_pkg.ALGORITHM = implicit_alg
+                return cache_cls(neighbor_map=neighbor_map)
         return cache_cls(
             neighbor_map=neighbor_map,
             gray_code=gray_code,
@@ -1403,8 +1435,16 @@ def patch_sparse_c2s_block(
             )
         )
         x_feats_saved = _stage_tensor_off_gpu(x.feats, torch_mod) if offload_skip else x.feats
+        x_shell = x
 
         h = x.replace(normed)
+        if offload_skip:
+            # Drop GPU buffer reference inside caller's SparseTensor shell (`h, sub = block(h)` keeps
+            # caller `h` bound until `_chunked_c2s_forward` returns — ~3.1 GiB at 768^3 -> 1536^3!).
+            try:
+                x_shell.feats = None
+            except Exception:
+                pass
         del x, normed
 
         can_fast_c2s = (
@@ -1502,6 +1542,12 @@ def patch_sparse_c2s_block(
             if h_scale is not None:
                 h._scale = tuple(sc / 2 for sc in h_scale)
             del h_up_feats, new_coords
+            try:
+                if hasattr(x_shell, "clear_spatial_cache"):
+                    x_shell.clear_spatial_cache()
+                x_shell.coords = None
+            except Exception:
+                pass
         else:
             h = self.conv1(h)
             if hasattr(h, "clear_spatial_cache"):
@@ -1522,17 +1568,25 @@ def patch_sparse_c2s_block(
             if not offload_skip:
                 x_feats_saved = _stage_tensor_off_gpu(x_feats_saved, torch_mod)
                 offload_skip = True
+                try:
+                    x_shell.feats = None
+                except Exception:
+                    pass
             if not offload_flat_idx and flat_idx_saved is not None and hasattr(flat_idx_saved, "cpu"):
                 if sub_ret is not None and getattr(sub_ret, "_c2s_gather_cache", None) is not None:
                     sub_ret._c2s_gather_cache = None
                 flat_idx_saved = flat_idx_saved.cpu()
                 flat_idx = None
                 offload_flat_idx = True
+            x_shell = None
             torch_mod.cuda.empty_cache()
         elif is_cuda_x and n_out >= 1_000_000:
+            x_shell = None
             free_pre_conv2 = _cuda_free_gb(torch_mod)
             if free_pre_conv2 is not None and free_pre_conv2 < VRAM_SAFETY_FLOOR_GB + 6.0:
                 torch_mod.cuda.empty_cache()
+        else:
+            x_shell = None
 
         conv2_slices_cpu = None
         est_conv2_bytes = n_out * int(self.out_channels) * int(h.feats.element_size())
