@@ -495,6 +495,173 @@ def _try_octant_grouped_c2s_conv1(
     return h_up_feats
 
 
+def patch_flex_gemm_neighbor_cache(
+    subm_mod: Any,
+    torch_mod: Any = None,
+) -> None:
+    """Release FlexGEMM build-time hashmap tensors before CUB radix-sort post-processing.
+
+    Upstream ``SubMConv3dFunction._compute_neighbor_cache`` keeps ``hashmap_keys`` and
+    ``hashmap_vals`` (0.5–1.2 GiB at 1536^3) alive in local scope while calling
+    ``neighbor_map_post_process_for_masked_implicit_gemm_1(_no_bwd)``, causing avoidable
+    ~250 MiB–1 GiB OOMs at peak decoder resolution. Deleting them immediately after
+    ``hashmap_build_submanifold_conv_neighbour_map`` is 100% bit-exact with zero speed cost.
+    Also retries once with ``empty_cache()`` (and a tighter 1.5x hashmap load factor if
+    the initial hashmap/neighbor build OOMs) to absorb allocator fragmentation.
+    """
+    subm_fn_cls = getattr(subm_mod, "SubMConv3dFunction", None)
+    cache_cls = getattr(subm_mod, "SubMConv3dNeighborCache", None)
+    if subm_fn_cls is None or cache_cls is None:
+        return
+    if getattr(subm_fn_cls, "_trellis2_vram_patched", False):
+        return
+
+    alg_cls = getattr(subm_mod, "Algorithm", None)
+    spconv_pkg = getattr(subm_mod, "spconv", None)
+    utils_mod = getattr(subm_mod, "utils", None)
+    kernels_mod = getattr(subm_mod, "kernels", None)
+    if any(x is None for x in (alg_cls, spconv_pkg, utils_mod, kernels_mod)):
+        return
+
+    explicit_algs = {
+        getattr(alg_cls, name, None)
+        for name in ("EXPLICIT_GEMM", "IMPLICIT_GEMM", "IMPLICIT_GEMM_SPLITK")
+    }
+    masked_algs = {
+        getattr(alg_cls, name, None)
+        for name in ("MASKED_IMPLICIT_GEMM", "MASKED_IMPLICIT_GEMM_SPLITK")
+    }
+
+    def _empty_cuda_cache() -> None:
+        if torch_mod is not None and hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+            torch_mod.cuda.empty_cache()
+
+    def _is_oom(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "out of memory" in msg or "cudaerrormemoryallocation" in msg
+
+    @staticmethod
+    def _low_vram_compute_neighbor_cache(
+        coords: Any,
+        shape: Any,
+        kernel_size: tuple[int, int, int],
+        dilation: tuple[int, int, int],
+        needs_grad: bool,
+    ) -> Any:
+        assert coords.is_contiguous(), "Coords should be contiguous"
+        if torch_mod is not None:
+            assert coords.dtype in [torch_mod.int32], "Unsupported coords dtype. Expect int32"
+        _, _, w, h, d = shape
+        alg = spconv_pkg.ALGORITHM
+        if alg not in explicit_algs and alg not in masked_algs:
+            raise ValueError(f"Unsupported algorithm {alg}")
+        if not coords.is_cuda:
+            raise NotImplementedError("CPU version of hashmap is not implemented")
+
+        ratio = float(getattr(spconv_pkg, "HASHMAP_RATIO", 2.0))
+        ratios_to_try = [ratio]
+        if ratio > 1.5:
+            ratios_to_try.append(1.5)
+
+        neighbor_map = None
+        last_exc: Exception | None = None
+        for attempt_idx, cur_ratio in enumerate(ratios_to_try):
+            hashmap_keys = None
+            hashmap_vals = None
+            try:
+                hashmap_keys, hashmap_vals = utils_mod.init_hashmap(
+                    shape, int(cur_ratio * coords.shape[0]), coords.device
+                )
+                neighbor_map = kernels_mod.cuda.hashmap_build_submanifold_conv_neighbour_map(
+                    hashmap_keys,
+                    hashmap_vals,
+                    coords,
+                    w,
+                    h,
+                    d,
+                    kernel_size[0],
+                    kernel_size[1],
+                    kernel_size[2],
+                    dilation[0],
+                    dilation[1],
+                    dilation[2],
+                )
+                del hashmap_keys, hashmap_vals
+                break
+            except RuntimeError as exc:
+                del hashmap_keys, hashmap_vals
+                if not _is_oom(exc):
+                    raise
+                last_exc = exc
+                _empty_cuda_cache()
+                if attempt_idx + 1 >= len(ratios_to_try):
+                    raise
+                log.warning(
+                    "FlexGEMM neighbor_map build OOM at HASHMAP_RATIO=%.2f (N=%d); retrying at %.2f",
+                    cur_ratio,
+                    int(coords.shape[0]),
+                    ratios_to_try[attempt_idx + 1],
+                )
+
+        if neighbor_map is None and last_exc is not None:
+            raise last_exc
+
+        if alg in explicit_algs:
+            return cache_cls(neighbor_map=neighbor_map)
+
+        vol = kernel_size[0] * kernel_size[1] * kernel_size[2]
+        assert vol <= 32, "Currently, the max kernel volume is 32 because kernel mask is encoded as uint32"
+
+        if needs_grad:
+            try:
+                gray_code, sorted_idx, valid_signal_i, valid_signal_o, valid_signal_seg = (
+                    kernels_mod.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1(
+                        neighbor_map
+                    )
+                )
+            except RuntimeError as exc:
+                if not _is_oom(exc):
+                    raise
+                _empty_cuda_cache()
+                gray_code, sorted_idx, valid_signal_i, valid_signal_o, valid_signal_seg = (
+                    kernels_mod.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1(
+                        neighbor_map
+                    )
+                )
+            return cache_cls(
+                neighbor_map=neighbor_map,
+                gray_code=gray_code,
+                sorted_idx=sorted_idx,
+                valid_signal_seg=valid_signal_seg,
+                valid_signal_i=valid_signal_i,
+                valid_signal_o=valid_signal_o,
+            )
+
+        try:
+            gray_code, sorted_idx = (
+                kernels_mod.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1_no_bwd(
+                    neighbor_map
+                )
+            )
+        except RuntimeError as exc:
+            if not _is_oom(exc):
+                raise
+            _empty_cuda_cache()
+            gray_code, sorted_idx = (
+                kernels_mod.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1_no_bwd(
+                    neighbor_map
+                )
+            )
+        return cache_cls(
+            neighbor_map=neighbor_map,
+            gray_code=gray_code,
+            sorted_idx=sorted_idx,
+        )
+
+    subm_fn_cls._compute_neighbor_cache = _low_vram_compute_neighbor_cache
+    subm_fn_cls._trellis2_vram_patched = True
+
+
 def patch_sparse_c2s_block(
     c2s_cls: Any,
     sparse_tensor_cls: Any,
@@ -570,7 +737,7 @@ def patch_sparse_c2s_block(
         offload_skip = bool(
             is_cuda_x
             and (
-                n_in >= 1_500_000
+                n_in >= 1_000_000
                 or (n_in >= 500_000 and free_gb is not None and free_gb < VRAM_SAFETY_FLOOR_GB + 6.0)
             )
         )
@@ -654,7 +821,20 @@ def patch_sparse_c2s_block(
             h.feats[s:e].copy_(tmp)
             del tmp
 
-        if is_cuda_x and n_out >= 1_000_000:
+        offload_flat_idx = False
+        flat_idx_saved = flat_idx
+        if is_cuda_x and n_out >= 1_500_000:
+            if not offload_skip and hasattr(x_feats_saved, "cpu"):
+                x_feats_saved = x_feats_saved.cpu()
+                offload_skip = True
+            if flat_idx_saved is not None and hasattr(flat_idx_saved, "cpu"):
+                if sub_ret is not None and getattr(sub_ret, "_c2s_gather_cache", None) is not None:
+                    sub_ret._c2s_gather_cache = None
+                flat_idx_saved = flat_idx_saved.cpu()
+                flat_idx = None
+                offload_flat_idx = True
+            torch_mod.cuda.empty_cache()
+        elif is_cuda_x and n_out >= 1_000_000:
             free_pre_conv2 = _cuda_free_gb(torch_mod)
             if free_pre_conv2 is not None and free_pre_conv2 < VRAM_SAFETY_FLOOR_GB + 6.0:
                 torch_mod.cuda.empty_cache()
@@ -665,18 +845,24 @@ def patch_sparse_c2s_block(
         del x_feats_saved
         rep = self.out_channels // (self.channels // 8)
 
-        if flat_idx is not None:
+        if flat_idx_saved is not None:
             # Fused chunked skip gather + repeat_interleave + in-place residual add (zero 20M-voxel x_up allocation)
             x_skip_2d = x_skip_feats.reshape(n_in * 8, self.channels // 8)
             for s in range(0, n_out, step):
                 e = min(s + step, n_out)
-                skip_sub = x_skip_2d[flat_idx[s:e]]
+                idx_chunk = (
+                    flat_idx_saved[s:e].to(h.device, non_blocking=True)
+                    if offload_flat_idx
+                    else flat_idx_saved[s:e]
+                )
+                skip_sub = x_skip_2d[idx_chunk]
+                del idx_chunk
                 if rep == 1:
                     h.feats[s:e].add_(skip_sub)
                 else:
                     h.feats[s:e].add_(skip_sub.repeat_interleave(rep, dim=1))
                 del skip_sub
-            del x_skip_2d, x_skip_feats, flat_idx
+            del x_skip_2d, x_skip_feats, flat_idx_saved, flat_idx
         else:
             x_skip = sparse_tensor_cls(x_skip_feats, x_coords, x_shape)
             if x_scale is not None:
@@ -765,11 +951,29 @@ def patch_sparse_unet_decoder(
                         scale_k = str(getattr(h, "_scale", ""))
                         h._spatial_cache[scale_k] = stage_dict
 
-                if is_cuda_x and saved_stage_caches and i >= 2:
-                    free_stage = _cuda_free_gb(torch_mod)
-                    if free_stage is not None and free_stage < VRAM_SAFETY_FLOOR_GB + 5.0:
-                        saved_stage_caches.clear()
-                        torch_mod.cuda.empty_cache()
+                if is_cuda_x:
+                    n_stage_vox = int(h.coords.shape[0])
+                    need_stage_evict = n_stage_vox >= 1_000_000 or i == num_stages - 1
+                    if not need_stage_evict and saved_stage_caches and i >= 2:
+                        free_stage = _cuda_free_gb(torch_mod)
+                        if free_stage is not None and free_stage < VRAM_SAFETY_FLOOR_GB + 5.0:
+                            need_stage_evict = True
+                    if need_stage_evict:
+                        evicted = False
+                        if saved_stage_caches:
+                            saved_stage_caches.clear()
+                            evicted = True
+                        for idx_s, s_tensor in enumerate(subs):
+                            if getattr(s_tensor, "_c2s_gather_cache", None) is not None:
+                                s_tensor._c2s_gather_cache = None
+                                evicted = True
+                            if hasattr(s_tensor, "cpu") and getattr(
+                                getattr(s_tensor, "feats", None), "is_cuda", False
+                            ):
+                                subs[idx_s] = s_tensor.cpu()
+                                evicted = True
+                        if evicted:
+                            torch_mod.cuda.empty_cache()
 
                 if stream and num_res > 0:
                     res.to(dev)
@@ -3499,6 +3703,12 @@ def install_trellis2_vram_optimizations(
         conv_config.FLEX_GEMM_HASHMAP_RATIO = float(os.environ["TRELLIS2_HASHMAP_RATIO"])
 
     patch_layernorm32(LayerNorm32, torch_mod, DEFAULT_VOXEL_CHUNK_SIZE)
+    try:
+        import flex_gemm.ops.spconv.submanifold_conv3d as flex_subm_mod  # type: ignore[import-not-found]
+
+        patch_flex_gemm_neighbor_cache(flex_subm_mod, torch_mod)
+    except Exception as exc:
+        log.debug("Skipping FlexGEMM neighbor cache patch: %s", exc)
     patch_sparse_convnext_block(
         SparseConvNeXtBlock3d, f_mod, DEFAULT_VOXEL_CHUNK_SIZE, torch_mod=torch_mod
     )
