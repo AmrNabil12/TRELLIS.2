@@ -520,13 +520,38 @@ class _DiskMmapTensor:
         self.close()
 
 
+def _clear_oom_traceback_frames(exc: BaseException) -> None:
+    """Release GPU tensors pinned in failed kernel/autotune stack frames before OOM retry."""
+    tb = getattr(exc, "__traceback__", None)
+    if tb is not None:
+        try:
+            traceback.clear_frames(tb)
+        except Exception:
+            pass
+
+
+def _estimate_subm_conv_needed_bytes(conv_mod: Any, sp_tensor: Any, est_out_bytes: int) -> int:
+    """Estimate peak additional VRAM needed for an unchunked SparseConv3d call (including neighbor_cache if unbuilt)."""
+    n = int(sp_tensor.feats.shape[0])
+    w = getattr(conv_mod, "weight", None)
+    has_nc = False
+    if w is not None and getattr(w, "ndim", 0) == 5 and hasattr(sp_tensor, "get_spatial_cache"):
+        _co, kd, kh, kw, _ci = (int(d) for d in w.shape)
+        dil = getattr(conv_mod, "dilation", (1, 1, 1))
+        nc_key = f"SubMConv3d_neighbor_cache_{kw}x{kh}x{kd}_dilation{dil}"
+        has_nc = sp_tensor.get_spatial_cache(nc_key) is not None
+    # Unbuilt neighbor_cache needs ~108B/voxel (neighbor_map) + ~32B/voxel (hashmap/sort/valid_kernel)
+    nc_bytes = 0 if has_nc else (n * 144)
+    return est_out_bytes + nc_bytes + int(1.5 * (1024**3))
+
+
 def _stage_tensor_off_gpu(
     src_gpu: Any,
     torch_mod: Any,
     min_free_ram_gb: float = 10.0,
     row_chunk: int = 4_194_304,
 ) -> Any:
-    """Move ``src_gpu`` off GPU into disk-backed mmap when host/cgroup RAM is tight, else CPU RAM."""
+    """Move ``src_gpu`` off GPU into disk-backed mmap (>=256 MiB) so container RAM limits are never exceeded."""
     if not bool(getattr(src_gpu, "is_cuda", False)):
         return src_gpu.clone() if hasattr(src_gpu, "clone") else src_gpu
     nbytes = int(src_gpu.numel()) * int(src_gpu.element_size())
@@ -534,11 +559,10 @@ def _stage_tensor_off_gpu(
     use_mmap = False
     if mode in {"1", "true", "yes", "always"}:
         use_mmap = callable(getattr(torch_mod, "from_file", None))
-    elif mode != "0" and mode != "false" and nbytes >= 256 * (1024**2) and callable(getattr(torch_mod, "from_file", None)):
-        _lim_gb, avail_gb = _host_ram_stats_gb()
-        need_gb = nbytes / (1024**3) + min_free_ram_gb
-        if avail_gb is None or avail_gb < need_gb:
-            use_mmap = True
+    elif mode not in {"0", "false", "no", "off"} and nbytes >= 256 * (1024**2) and callable(getattr(torch_mod, "from_file", None)):
+        # Container orchestrators (e.g. RunPod) may expose bare-metal /proc/meminfo while enforcing
+        # a stricter container RAM cap externally; always mmap >=256 MiB tensors onto disk page cache.
+        use_mmap = True
 
     if use_mmap:
         fd = -1
@@ -687,6 +711,7 @@ def _chunked_subm_conv3d_slices_to_cpu(
                 del w_s, b_s
                 if not _is_cuda_oom_msg(exc) or c_step <= min_c_step:
                     raise
+                _clear_oom_traceback_frames(exc)
                 if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
                     torch_mod.cuda.empty_cache()
                 next_step = max(min_c_step, (c_step // 2) // min_c_step * min_c_step)
@@ -822,7 +847,8 @@ def patch_sparse_convnext_block(
         want_chunked_conv = False
         if is_cuda and torch_mod is not None and est_out_bytes >= 1024**3:
             free_gb = _cuda_free_gb(torch_mod)
-            if free_gb is not None and (free_gb * (1024**3)) < (est_out_bytes + int(0.75 * (1024**3))):
+            needed_b = _estimate_subm_conv_needed_bytes(self.conv, x, est_out_bytes)
+            if free_gb is not None and (free_gb * (1024**3)) < needed_b:
                 want_chunked_conv = True
 
         if want_chunked_conv:
@@ -835,22 +861,27 @@ def patch_sparse_convnext_block(
             cpu_slices = _chunked_subm_conv3d_slices_to_cpu(self.conv, x, torch_mod)
 
         if cpu_slices is None:
+            conv_oom = False
             try:
                 h = self.conv(x)
             except RuntimeError as exc:
                 if not (is_cuda and torch_mod is not None and _is_cuda_oom_msg(exc)):
                     raise
+                _clear_oom_traceback_frames(exc)
+                conv_oom = True
+            if conv_oom:
+                gc.collect()
                 if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
                     torch_mod.cuda.empty_cache()
                 log.warning(
-                    "ConvNeXt SubMConv3d OOM (N=%d, Co=%d, est_out=%.2f GiB); retrying with channel-chunked CPU staging",
+                    "ConvNeXt SubMConv3d OOM (N=%d, Co=%d, est_out=%.2f GiB); retrying with channel-chunked staging",
                     n,
                     co,
                     est_out_bytes / (1024**3),
                 )
                 cpu_slices = _chunked_subm_conv3d_slices_to_cpu(self.conv, x, torch_mod)
                 if cpu_slices is None:
-                    raise
+                    raise RuntimeError("ConvNeXt SubMConv3d OOM and channel-chunked fallback unavailable")
 
         if cpu_slices is not None:
             dev = x_feats.device
@@ -941,19 +972,25 @@ def patch_sparse_res_block(
         cpu_slices = None
         if is_cuda and est_bytes >= 1024**3:
             free_gb = _cuda_free_gb(torch_mod)
-            if free_gb is not None and (free_gb * (1024**3)) < (est_bytes + int(0.75 * (1024**3))):
+            needed_b = _estimate_subm_conv_needed_bytes(conv_mod, sp_in, est_bytes)
+            if free_gb is not None and (free_gb * (1024**3)) < needed_b:
                 cpu_slices = _chunked_subm_conv3d_slices_to_cpu(conv_mod, sp_in, torch_mod)
         if cpu_slices is None:
+            res_oom = False
             try:
                 return conv_mod(sp_in)
             except RuntimeError as exc:
                 if not (is_cuda and _is_cuda_oom_msg(exc)):
                     raise
+                _clear_oom_traceback_frames(exc)
+                res_oom = True
+            if res_oom:
+                gc.collect()
                 if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
                     torch_mod.cuda.empty_cache()
                 cpu_slices = _chunked_subm_conv3d_slices_to_cpu(conv_mod, sp_in, torch_mod)
                 if cpu_slices is None:
-                    raise
+                    raise RuntimeError("SparseResBlock3d SubMConv3d OOM and channel-chunked fallback unavailable")
         if co == int(sp_in.feats.shape[-1]):
             _copy_cpu_slices_into_gpu_feats(sp_in.feats, cpu_slices, step)
             del cpu_slices
@@ -1216,10 +1253,10 @@ def patch_flex_gemm_neighbor_cache(
                 del hashmap_keys, hashmap_vals
                 if not _is_oom(exc):
                     raise
-                last_exc = exc
-                _empty_cuda_cache()
+                _clear_oom_traceback_frames(exc)
                 if attempt_idx + 1 >= len(ratios_to_try):
                     raise
+                _empty_cuda_cache()
                 log.warning(
                     "FlexGEMM neighbor_map build OOM at HASHMAP_RATIO=%.2f (N=%d); retrying at %.2f",
                     cur_ratio,
@@ -1501,33 +1538,39 @@ def patch_sparse_c2s_block(
         est_conv2_bytes = n_out * int(self.out_channels) * int(h.feats.element_size())
         if is_cuda_x and est_conv2_bytes >= 1024**3:
             free_pre_conv2 = _cuda_free_gb(torch_mod)
-            if free_pre_conv2 is not None and (free_pre_conv2 * (1024**3)) < (
-                est_conv2_bytes + int(0.75 * (1024**3))
-            ):
+            needed_conv2_b = _estimate_subm_conv_needed_bytes(self.conv2, h, est_conv2_bytes)
+            if free_pre_conv2 is not None and (free_pre_conv2 * (1024**3)) < needed_conv2_b:
                 log.info(
-                    "Using output-channel chunked SubMConv3d in C2S conv2 (N=%d, Co=%d, est_out=%.2f GiB)",
+                    "Using output-channel chunked SubMConv3d in C2S conv2 (N=%d, Co=%d, est_out=%.2f GiB, free=%.2f GiB, needed=%.2f GiB)",
                     n_out,
                     int(self.out_channels),
                     est_conv2_bytes / (1024**3),
+                    free_pre_conv2,
+                    needed_conv2_b / (1024**3),
                 )
                 conv2_slices_cpu = _chunked_subm_conv3d_slices_to_cpu(self.conv2, h, torch_mod)
 
         if conv2_slices_cpu is None:
+            conv2_oom = False
             try:
                 h = self.conv2(h)
             except RuntimeError as exc:
                 if not (is_cuda_x and _is_cuda_oom_msg(exc)):
                     raise
+                _clear_oom_traceback_frames(exc)
+                conv2_oom = True
+            if conv2_oom:
+                gc.collect()
                 torch_mod.cuda.empty_cache()
                 log.warning(
-                    "C2S conv2 SubMConv3d OOM (N=%d, Co=%d, est_out=%.2f GiB); retrying with channel-chunked CPU staging",
+                    "C2S conv2 SubMConv3d OOM (N=%d, Co=%d, est_out=%.2f GiB); retrying with channel-chunked staging",
                     n_out,
                     int(self.out_channels),
                     est_conv2_bytes / (1024**3),
                 )
                 conv2_slices_cpu = _chunked_subm_conv3d_slices_to_cpu(self.conv2, h, torch_mod)
                 if conv2_slices_cpu is None:
-                    raise
+                    raise RuntimeError("C2S conv2 SubMConv3d OOM and channel-chunked fallback unavailable")
 
         if conv2_slices_cpu is not None:
             _copy_cpu_slices_into_gpu_feats(h.feats, conv2_slices_cpu, step)
@@ -4001,13 +4044,11 @@ class VRAMModelManager:
         self._torch = torch_mod
         self._vram_gb = vram_gb
         host_lim_gb, host_avail_gb = _host_ram_stats_gb()
-        pin_mode = os.environ.get("TRELLIS2_PIN_MEMORY", "auto").strip().lower()
+        pin_mode = os.environ.get("TRELLIS2_PIN_MEMORY", "0").strip().lower()
         # Pinning 15+ GiB of offloaded DiT weights in PyTorch's CachingHostAllocator permanently locks
-        # unswappable pages and triggers Docker cgroup OOM kills (exit 137) on 24–48 GB containers.
-        # Only enable page-locking when explicitly forced (1) or on >=64 GiB host cgroups.
-        want_pin = pin_mode in {"1", "true", "yes", "on"} or (
-            pin_mode == "auto" and host_lim_gb is not None and host_lim_gb >= 64.0
-        )
+        # unswappable pages and triggers container OOM kills (exit 137) even when bare-metal /proc/meminfo
+        # reports >64 GiB. Keep disabled by default unless explicitly opted in via TRELLIS2_PIN_MEMORY=1.
+        want_pin = pin_mode in {"1", "true", "yes", "on"}
         self._pin_enabled = bool(
             enable_pin_memory
             and os.name != "nt"
