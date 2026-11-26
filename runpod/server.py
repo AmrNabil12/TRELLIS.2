@@ -301,7 +301,7 @@ def _cuda_free_gb(torch_mod: Any) -> float | None:
         return None
 
 
-_CUDART_LIB_CACHE: dict[str, Any] = {"loaded": False, "lib": None}
+_CUDART_LIB_CACHE: dict[str, Any] = {"loaded": False, "lib": None, "libs": []}
 
 
 def _is_oom_like(exc: BaseException) -> bool:
@@ -312,36 +312,76 @@ def _is_oom_like(exc: BaseException) -> bool:
 def _clear_sticky_cuda_error(torch_mod: Any, cudart_lib: Any = None) -> int:
     """Consume any pending recoverable CUDA runtime error (e.g. raw cudaMalloc OOM in CuMesh).
 
-    Third-party C++ extensions such as CuMesh call raw cudaMalloc() and throw TORCH_CHECK on the
-    return code without calling cudaGetLastError(), leaving cudaErrorMemoryAllocation armed in the
-    per-thread CUDA runtime slot and causing the next unrelated tensor.to('cuda') call to fail.
+    Third-party C++ extensions such as CuMesh may link a different libcudart DSO than PyTorch's
+    bundled wheel runtime and throw TORCH_CHECK on raw cudaMalloc() without clearing
+    cudaGetLastError(), leaving cudaErrorMemoryAllocation armed across subsequent CUDA calls.
     """
     last_err = 0
-    lib = cudart_lib
-    if lib is None:
+    if cudart_lib is not None:
+        libs = [cudart_lib]
+    else:
         if not _CUDART_LIB_CACHE["loaded"]:
             _CUDART_LIB_CACHE["loaded"] = True
             import ctypes
 
-            for cand in ("libcudart.so", "libcudart.so.12", "libcudart.so.11.0"):
+            cands: list[str | None] = (
+                [None] if os.name != "nt" else []
+            ) + ["libcudart.so", "libcudart.so.12", "libcudart.so.11.0"]
+            try:
+                maps_p = Path("/proc/self/maps")
+                if maps_p.is_file():
+                    for line in maps_p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if "libcudart" in line and ".so" in line:
+                            so_path = line.split()[-1]
+                            if so_path not in cands:
+                                cands.append(so_path)
+            except Exception:
+                pass
+            loaded_libs: list[Any] = []
+            seen_handles: set[int] = set()
+            for cand in cands:
                 try:
-                    _CUDART_LIB_CACHE["lib"] = ctypes.CDLL(cand)
-                    break
-                except OSError:
+                    handle = ctypes.CDLL(cand)
+                    h_id = getattr(handle, "_handle", id(handle))
+                    if h_id not in seen_handles and callable(getattr(handle, "cudaGetLastError", None)):
+                        seen_handles.add(h_id)
+                        loaded_libs.append(handle)
+                except Exception:
                     continue
-        lib = _CUDART_LIB_CACHE["lib"]
-    if lib is not None:
+            _CUDART_LIB_CACHE["libs"] = loaded_libs
+            _CUDART_LIB_CACHE["lib"] = loaded_libs[0] if loaded_libs else None
+        libs = list(_CUDART_LIB_CACHE.get("libs") or [])
+        if not libs and _CUDART_LIB_CACHE.get("lib") is not None:
+            libs = [_CUDART_LIB_CACHE["lib"]]
+
+    for lib in libs:
         get_last = getattr(lib, "cudaGetLastError", None)
         if callable(get_last):
             try:
-                last_err = int(get_last())
+                err = int(get_last())
+                if err != 0:
+                    last_err = err
             except Exception:
                 pass
+
     if torch_mod is not None and hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
         sync_fn = getattr(torch_mod.cuda, "synchronize", None)
         if callable(sync_fn):
             try:
                 sync_fn()
+            except Exception:
+                pass
+        # Probe PyTorch's internal C10_CUDA_KERNEL_LAUNCH_CHECK slot so any queued async/malloc error
+        # is consumed here rather than breaking the next OOM-retry model transfer.
+        zeros_fn = getattr(torch_mod, "zeros", None)
+        if callable(zeros_fn):
+            try:
+                probe = zeros_fn((1,), device="cuda")
+                if hasattr(probe, "add_"):
+                    probe.add_(1)
+                del probe
+                if callable(sync_fn):
+                    sync_fn()
             except Exception:
                 pass
     return last_err
@@ -3034,7 +3074,49 @@ def patch_sparse_structure_cudagraph(ss_flow_cls: Any, torch_mod: Any) -> None:
     ss_flow_cls._trellis2_cudagraph_patched = True
 
 
-def patch_mesh_simplify_noop(mesh_cls: Any) -> None:
+def _compact_mesh_vertices(
+    vertices: Any,
+    faces: Any,
+    torch_mod: Any,
+    face_chunk: int = 4_000_000,
+) -> tuple[Any, Any]:
+    """Strip unreferenced dual-grid vertices before CuMesh to shrink vertex/boundary buffers ~5-7x."""
+    if vertices is None or faces is None or torch_mod is None:
+        return vertices, faces
+    try:
+        v_count = int(vertices.shape[0])
+        f_count = int(faces.shape[0])
+    except Exception:
+        return vertices, faces
+    if v_count <= 0 or f_count <= 0:
+        return vertices, faces
+
+    dev = vertices.device
+    used = torch_mod.zeros((v_count,), dtype=torch_mod.bool, device=dev)
+    for s in range(0, f_count, face_chunk):
+        e = min(s + face_chunk, f_count)
+        used[faces[s:e].reshape(-1).long()] = True
+
+    keep_idx = used.nonzero(as_tuple=True)[0]
+    del used
+    new_v_count = int(keep_idx.shape[0])
+    if new_v_count >= v_count:
+        del keep_idx
+        return vertices, faces
+
+    remap = torch_mod.empty((v_count,), dtype=faces.dtype, device=dev)
+    remap[keep_idx] = torch_mod.arange(new_v_count, dtype=faces.dtype, device=dev)
+    new_vertices = vertices[keep_idx].contiguous()
+    del keep_idx
+    new_faces = torch_mod.empty_like(faces, device=dev)
+    for s in range(0, f_count, face_chunk):
+        e = min(s + face_chunk, f_count)
+        new_faces[s:e].copy_(remap[faces[s:e].long()])
+    del remap
+    return new_vertices, new_faces
+
+
+def patch_mesh_simplify_noop(mesh_cls: Any, torch_mod: Any = None) -> None:
     """Skip redundant CuMesh 12M-triangle build+readback when face count is already <= target (e.g. 16,777,216)."""
     if mesh_cls is None or _is_already_patched(mesh_cls, "_trellis2_simplify_patched"):
         return
@@ -3047,6 +3129,16 @@ def patch_mesh_simplify_noop(mesh_cls: Any) -> None:
         shape = getattr(faces, "shape", None)
         if shape is not None and len(shape) >= 1 and shape[0] <= target:
             return
+        verts = getattr(self, "vertices", None)
+        if torch_mod is not None and verts is not None and faces is not None:
+            try:
+                if getattr(verts, "is_cuda", False) and getattr(faces, "is_cuda", False):
+                    self.vertices, self.faces = _compact_mesh_vertices(verts, faces, torch_mod)
+            except Exception:
+                pass
+            gc.collect()
+            if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+                torch_mod.cuda.empty_cache()
         orig_simplify(self, target=target, verbose=verbose, options=options)
 
     mesh_cls.simplify = _fast_simplify
@@ -3628,6 +3720,8 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             _flush_allocator_for_cpp()
             vertices = _to_dev(vertices)
             faces = _to_dev(faces)
+            vertices, faces = _compact_mesh_vertices(vertices, faces, t_mod)
+            _flush_allocator_for_cpp()
 
             mesh = cumesh_local.CuMesh()
             mesh.init(vertices, faces)
@@ -4711,7 +4805,7 @@ def install_trellis2_vram_optimizations(
         torch_mod,
     )
     patch_sparse_structure_cudagraph(SparseStructureFlowModel, torch_mod)
-    patch_mesh_simplify_noop(Mesh)
+    patch_mesh_simplify_noop(Mesh, torch_mod)
     patch_cv2_inpaint_fastpath(cv2, np)
     try:
         import cumesh.remeshing as cumesh_remeshing_mod  # type: ignore[import-not-found]
@@ -5357,19 +5451,37 @@ class Trellis2Engine:
 
             m = meshes[0]
             del meshes
+            if (
+                getattr(getattr(m, "vertices", None), "is_cuda", False)
+                and getattr(getattr(m, "faces", None), "is_cuda", False)
+            ):
+                orig_v_cnt = int(m.vertices.shape[0])
+                m.vertices, m.faces = _compact_mesh_vertices(m.vertices, m.faces, torch)
+                if int(m.vertices.shape[0]) < orig_v_cnt:
+                    log.info(
+                        "Compacted mesh vertices before CuMesh fill_holes: %d -> %d (faces=%d)",
+                        orig_v_cnt,
+                        int(m.vertices.shape[0]),
+                        int(m.faces.shape[0]),
+                    )
 
-            # Stage tex_slat_decoder before deciding whether to overlap CuMesh.fill_holes()
-            # so any LRU eviction + empty_cache() finishes before concurrent CUDA work starts.
             tex_dec = pipe.models.get("tex_slat_decoder")
+            defer_tex_load = bool(tight_gpu or res > 1024)
             if mgr is not None:
-                if tight_gpu or res > 1024:
-                    mgr.evict_except(["tex_slat_decoder"], clear_cache=True)
-                mgr.ensure_on_gpu(
-                    ["tex_slat_decoder"],
-                    pipe.device,
-                    required_free_gb=floor + (6.0 if res > 1024 else 3.5),
-                )
-                self._configure_decoder_residency(tex_dec)
+                if defer_tex_load:
+                    # Free ALL neural models & PyTorch cached blocks before raw-cudaMalloc CuMesh.fill_holes()
+                    mgr.evict_except([], clear_cache=True)
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                else:
+                    # Stage tex_slat_decoder before deciding whether to overlap CuMesh.fill_holes()
+                    mgr.ensure_on_gpu(
+                        ["tex_slat_decoder"],
+                        pipe.device,
+                        required_free_gb=floor + 3.5,
+                    )
+                    self._configure_decoder_residency(tex_dec)
             elif tex_dec is not None:
                 tex_dec.low_vram = True
 
@@ -5377,7 +5489,7 @@ class Trellis2Engine:
             overlap_min_free = floor + (8.0 if res > 1024 else 5.0)
             can_overlap_fill = bool(
                 mgr is not None
-                and not (tight_gpu and res > 1024)
+                and not defer_tex_load
                 and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
                 and os.environ.get("TRELLIS2_STREAM_OVERLAP", "1") != "0"
                 and torch is not None
@@ -5393,6 +5505,46 @@ class Trellis2Engine:
             verts_staged: Any = None
             faces_staged: Any = None
             spill_mesh_geom = False
+
+            def _run_fill_holes_resilient(mesh_obj: Any) -> None:
+                try:
+                    mesh_obj.fill_holes()
+                except Exception as fh_exc:
+                    if not _is_oom_like(fh_exc):
+                        raise
+                    _clear_sticky_cuda_error(torch)
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    f_cnt = int(getattr(getattr(mesh_obj, "faces", None), "shape", (0,))[0])
+                    if f_cnt > 16_777_216:
+                        log.warning(
+                            "CuMesh.fill_holes OOM at %d faces; simplifying to 16,777,216 cap first (%s)",
+                            f_cnt,
+                            fh_exc,
+                        )
+                        mesh_obj.simplify(16_777_216)
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        try:
+                            mesh_obj.fill_holes()
+                        except Exception as fh_exc2:
+                            if not _is_oom_like(fh_exc2):
+                                raise
+                            _clear_sticky_cuda_error(torch)
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            log.warning(
+                                "Deferring CuMesh.fill_holes to postprocess.to_glb after post-simplify OOM (%s)",
+                                fh_exc2,
+                            )
+                    else:
+                        log.warning(
+                            "Deferring CuMesh.fill_holes to postprocess.to_glb after VRAM OOM (%s)",
+                            fh_exc,
+                        )
 
             if can_overlap_fill:
                 shape_done_evt = torch.cuda.Event()
@@ -5412,11 +5564,11 @@ class Trellis2Engine:
                 )
                 fill_thread.start()
             else:
-                m.fill_holes()
+                _run_fill_holes_resilient(m)
                 free_after_shape = _cuda_free_gb(torch)
                 spill_mesh_geom = bool(
                     mgr is None
-                    or (tight_gpu and res > 1024)
+                    or defer_tex_load
                     or free_after_shape is None
                     or free_after_shape < (floor + 5.0)
                 )
@@ -5425,6 +5577,13 @@ class Trellis2Engine:
                 del m
                 if mgr is None or spill_mesh_geom:
                     self._release_vram(offload_models=False)
+                if defer_tex_load and mgr is not None:
+                    mgr.ensure_on_gpu(
+                        ["tex_slat_decoder"],
+                        pipe.device,
+                        required_free_gb=floor + (6.0 if res > 1024 else 3.5),
+                    )
+                    self._configure_decoder_residency(tex_dec)
 
             _emit("decoding_textures")
             t_st = time.monotonic()
