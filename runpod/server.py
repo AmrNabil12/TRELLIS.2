@@ -4828,11 +4828,14 @@ class JobManager:
     def _read_status(self, job_id: str) -> JobRecord | None:
         if not _JOB_ID_RE.match(job_id):
             return None
-        job_dir = self._jobs_dir / job_id
-        status_file = job_dir / "status.json"
-        if not status_file.is_file():
-            return None
         try:
+            jobs_root = self._jobs_dir.resolve()
+            job_dir = (jobs_root / job_id).resolve()
+            if job_dir.parent != jobs_root:
+                return None
+            status_file = (job_dir / "status.json").resolve()
+            if status_file.parent != job_dir or not status_file.is_file():
+                return None
             data = json.loads(status_file.read_text(encoding="utf-8"))
             return JobRecord(
                 job_id=data["job_id"],
@@ -4848,7 +4851,7 @@ class JobManager:
                 glb_path=job_dir / "mesh.glb",
                 error=data.get("error"),
             )
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
             log.warning("Failed to read job status for %s: %s", job_id, exc)
             return None
 
