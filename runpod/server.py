@@ -345,16 +345,271 @@ def _is_cuda_oom_msg(exc: BaseException) -> bool:
     return "out of memory" in msg or "cudaerrormemoryallocation" in msg
 
 
+def _host_ram_stats_gb() -> tuple[float | None, float | None]:
+    """Return ``(effective_limit_gb, effective_available_gb)`` respecting Linux cgroup v1/v2 limits."""
+    mem_total_b: int | None = None
+    mem_avail_b: int | None = None
+    try:
+        meminfo = Path("/proc/meminfo")
+        if meminfo.is_file():
+            for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("MemTotal:"):
+                    mem_total_b = int(line.split()[1]) * 1024
+                elif line.startswith("MemAvailable:"):
+                    mem_avail_b = int(line.split()[1]) * 1024
+    except Exception:
+        pass
+
+    cg_limit_b: int | None = None
+    cg_used_b: int | None = None
+    cg_reclaim_b = 0
+    max_sane = 1 << 56  # ignore "max" / unlimited sentinel (~2^63)
+    try:
+        cg2_max = Path("/sys/fs/cgroup/memory.max")
+        cg2_cur = Path("/sys/fs/cgroup/memory.current")
+        if cg2_max.is_file() and cg2_cur.is_file():
+            raw_max = cg2_max.read_text(encoding="utf-8").strip()
+            if raw_max.isdigit():
+                val = int(raw_max)
+                if 0 < val < max_sane:
+                    cg_limit_b = val
+            raw_cur = cg2_cur.read_text(encoding="utf-8").strip()
+            if raw_cur.isdigit():
+                cg_used_b = int(raw_cur)
+            cg2_stat = Path("/sys/fs/cgroup/memory.stat")
+            if cg2_stat.is_file():
+                for line in cg2_stat.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.startswith("inactive_file "):
+                        cg_reclaim_b = int(line.split()[1])
+                        break
+        else:
+            cg1_lim = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            cg1_use = Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+            if cg1_lim.is_file() and cg1_use.is_file():
+                val = int(cg1_lim.read_text(encoding="utf-8").strip())
+                if 0 < val < max_sane:
+                    cg_limit_b = val
+                cg_used_b = int(cg1_use.read_text(encoding="utf-8").strip())
+                cg1_stat = Path("/sys/fs/cgroup/memory/memory.stat")
+                if cg1_stat.is_file():
+                    for line in cg1_stat.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if line.startswith("total_inactive_file "):
+                            cg_reclaim_b = int(line.split()[1])
+                            break
+    except Exception:
+        pass
+
+    eff_limit_b = mem_total_b
+    if cg_limit_b is not None:
+        eff_limit_b = cg_limit_b if eff_limit_b is None else min(eff_limit_b, cg_limit_b)
+
+    eff_avail_b = mem_avail_b
+    if cg_limit_b is not None and cg_used_b is not None:
+        cg_free_b = max(0, cg_limit_b - max(0, cg_used_b - cg_reclaim_b))
+        eff_avail_b = cg_free_b if eff_avail_b is None else min(eff_avail_b, cg_free_b)
+
+    limit_gb = None if eff_limit_b is None else eff_limit_b / (1024**3)
+    avail_gb = None if eff_avail_b is None else eff_avail_b / (1024**3)
+    return limit_gb, avail_gb
+
+
+def _choose_mmap_scratch_dir(min_free_bytes: int = 2 * (1024**3)) -> Path:
+    """Pick a real disk-backed scratch directory (never RAM-backed tmpfs like /dev/shm)."""
+    tmpfs_mounts: set[str] = {"/dev/shm", "/run"}
+    try:
+        mounts = Path("/proc/mounts")
+        if mounts.is_file():
+            for line in mounts.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] in {"tmpfs", "ramfs"}:
+                    tmpfs_mounts.add(parts[1].rstrip("/") or "/")
+    except Exception:
+        pass
+
+    def _is_tmpfs_path(p: Path) -> bool:
+        try:
+            resolved = str(p.resolve())
+        except Exception:
+            resolved = str(p)
+        best_mount = ""
+        is_ram = False
+        try:
+            mounts = Path("/proc/mounts")
+            if mounts.is_file():
+                for line in mounts.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    mp = parts[1]
+                    if resolved == mp or resolved.startswith(mp.rstrip("/") + "/") or mp == "/":
+                        if len(mp) >= len(best_mount):
+                            best_mount = mp
+                            is_ram = parts[2] in {"tmpfs", "ramfs"}
+                return is_ram
+        except Exception:
+            pass
+        return any(resolved == m or resolved.startswith(m + "/") for m in tmpfs_mounts if m != "/")
+
+    candidates: list[Path] = []
+    env_dir = os.environ.get("TRELLIS2_MMAP_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir))
+    for root in (Path("/runpod-volume"), Path("/workspace"), Path("/var/tmp")):
+        if root.is_dir():
+            candidates.append(root / ".trellis2_mmap" if str(root) != "/var/tmp" else root)
+    candidates.append(Path(tempfile.gettempdir()))
+
+    for cand in candidates:
+        try:
+            if _is_tmpfs_path(cand):
+                continue
+            cand.mkdir(parents=True, exist_ok=True)
+            if os.access(cand, os.W_OK) and shutil.disk_usage(cand).free >= min_free_bytes:
+                return cand
+        except Exception:
+            continue
+    fallback = Path("/var/tmp") if Path("/var/tmp").is_dir() else Path(tempfile.gettempdir())
+    return fallback
+
+
+class _DiskMmapTensor:
+    """File-backed mmap tensor wrapper that uses <=128 MiB anonymous host RAM and self-unlinks."""
+
+    def __init__(self, tensor: Any, path: str) -> None:
+        self.tensor: Any = tensor
+        self.path: str | None = path
+
+    @property
+    def shape(self) -> Any:
+        return self.tensor.shape
+
+    @property
+    def dtype(self) -> Any:
+        return self.tensor.dtype
+
+    def is_contiguous(self) -> bool:
+        return bool(self.tensor.is_contiguous())
+
+    def __getitem__(self, item: Any) -> Any:
+        return self.tensor[item]
+
+    def to(self, device: Any, non_blocking: bool = False) -> Any:
+        if str(device) == "cpu":
+            return self.tensor
+        n = int(self.tensor.shape[0])
+        step = 4_194_304
+        if n <= step:
+            return self.tensor.to(device, non_blocking=non_blocking)
+        out = self.tensor.new_empty(self.tensor.shape, device=device)
+        for s in range(0, n, step):
+            e = min(s + step, n)
+            out[s:e].copy_(self.tensor[s:e].to(device, non_blocking=non_blocking))
+        return out
+
+    def close(self) -> None:
+        self.tensor = None
+        p = self.path
+        self.path = None
+        if p:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _stage_tensor_off_gpu(
+    src_gpu: Any,
+    torch_mod: Any,
+    min_free_ram_gb: float = 10.0,
+    row_chunk: int = 4_194_304,
+) -> Any:
+    """Move ``src_gpu`` off GPU into disk-backed mmap when host/cgroup RAM is tight, else CPU RAM."""
+    if not bool(getattr(src_gpu, "is_cuda", False)):
+        return src_gpu.clone() if hasattr(src_gpu, "clone") else src_gpu
+    nbytes = int(src_gpu.numel()) * int(src_gpu.element_size())
+    mode = os.environ.get("TRELLIS2_CONV_MMAP", "auto").strip().lower()
+    use_mmap = False
+    if mode in {"1", "true", "yes", "always"}:
+        use_mmap = callable(getattr(torch_mod, "from_file", None))
+    elif mode != "0" and mode != "false" and nbytes >= 256 * (1024**2) and callable(getattr(torch_mod, "from_file", None)):
+        _lim_gb, avail_gb = _host_ram_stats_gb()
+        need_gb = nbytes / (1024**3) + min_free_ram_gb
+        if avail_gb is None or avail_gb < need_gb:
+            use_mmap = True
+
+    if use_mmap:
+        fd = -1
+        mmap_path = ""
+        try:
+            scratch_dir = _choose_mmap_scratch_dir(min_free_bytes=max(nbytes * 2, 512 * (1024**2)))
+            fd, mmap_path = tempfile.mkstemp(prefix="trellis2_stage_", suffix=".bin", dir=str(scratch_dir))
+            os.close(fd)
+            fd = -1
+            numel = int(src_gpu.numel())
+            flat_mmap = torch_mod.from_file(mmap_path, shared=True, size=numel, dtype=src_gpu.dtype)
+            mmap_t = flat_mmap.reshape(tuple(src_gpu.shape))
+            n = int(src_gpu.shape[0])
+            step = max(1, int(row_chunk))
+            for r0 in range(0, n, step):
+                r1 = min(r0 + step, n)
+                mmap_t[r0:r1].copy_(src_gpu[r0:r1].cpu())
+            # Hint Linux kernel that file pages are cold/reclaimable so cgroup memory stays low
+            posix_fadv = getattr(os, "posix_fadvise", None)
+            dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+            if callable(posix_fadv) and dontneed is not None:
+                try:
+                    adv_fd = os.open(mmap_path, os.O_RDONLY)
+                    try:
+                        posix_fadv(adv_fd, 0, 0, dontneed)
+                    finally:
+                        os.close(adv_fd)
+                except Exception:
+                    pass
+            return _DiskMmapTensor(mmap_t, mmap_path)
+        except Exception as exc:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if mmap_path:
+                try:
+                    os.unlink(mmap_path)
+                except OSError:
+                    pass
+            log.debug("Disk mmap staging unavailable (%s); falling back to CPU tensor", exc)
+
+    return src_gpu.cpu() if hasattr(src_gpu, "cpu") else src_gpu.clone()
+
+
+def _release_staged_obj(obj: Any) -> None:
+    if isinstance(obj, _DiskMmapTensor):
+        obj.close()
+
+
+def _release_staged_slices(slices: list[tuple[int, int, Any]] | None) -> None:
+    if not slices:
+        return
+    for _c0, _c1, sl in slices:
+        _release_staged_obj(sl)
+    slices.clear()
+
+
 def _chunked_subm_conv3d_slices_to_cpu(
     conv_mod: Any,
     x: Any,
     torch_mod: Any,
     max_slice_bytes: int | None = None,
 ) -> list[tuple[int, int, Any]] | None:
-    """Run SparseConv3d in output-channel slices copied to contiguous CPU buffers via bulk DMA.
+    """Run SparseConv3d in output-channel slices without exceeding GPU VRAM or container host RAM.
 
-    Returns ``[(c0, c1, slice_cpu), ...]`` where each ``slice_cpu`` is contiguous ``(N, c1 - c0)``
-    on CPU RAM (~20x faster than scattering into a strided ``(N, Co)`` CPU matrix).
+    - Earlier slices ``(c1 < Co)`` stream off GPU into disk-backed ``mmap`` (<=128 MiB anonymous
+      host RAM, preventing Docker ``exit code 137`` cgroup OOM kills) or pageable CPU RAM when
+      host RAM is ample.
+    - The final slice ``(c1 == Co)`` stays directly on GPU (zero host memory, zero PCIe transfer).
     Bit-exact: reuses a single FlexGEMM ``neighbor_cache`` across all slices and halves ``c_step``
     automatically on CUDA OOM.
     """
@@ -367,10 +622,11 @@ def _chunked_subm_conv3d_slices_to_cpu(
     if n <= 0 or co <= 0:
         return None
 
+    is_cuda = bool(getattr(x.feats, "is_cuda", False))
     grouped_fn = getattr(conv_mod, "_grouped_conv_fn", None)
     dilation = getattr(conv_mod, "dilation", (1, 1, 1))
     if grouped_fn is None:
-        if not bool(getattr(x.feats, "is_cuda", False)):
+        if not is_cuda:
             return None
         try:
             import flex_gemm  # type: ignore[import-not-found]
@@ -386,7 +642,7 @@ def _chunked_subm_conv3d_slices_to_cpu(
 
     elem_size = int(x.feats.element_size())
     if max_slice_bytes is None:
-        free_gb = _cuda_free_gb(torch_mod) if bool(getattr(x.feats, "is_cuda", False)) else None
+        free_gb = _cuda_free_gb(torch_mod) if is_cuda else None
         if free_gb is not None:
             # Target <=40% of currently free VRAM (clamped to 256 MiB .. 1.5 GiB)
             max_slice_bytes = int(min(1.5 * (1024**3), max(256 * (1024**2), free_gb * 0.40 * (1024**3))))
@@ -403,59 +659,68 @@ def _chunked_subm_conv3d_slices_to_cpu(
     if c_step >= co and co >= 32:
         c_step = max(min_c_step, co // 2)
 
-    if bool(getattr(x.feats, "is_cuda", False)) and hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+    if is_cuda and hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
         torch_mod.cuda.empty_cache()
 
     neighbor_cache_key = f"SubMConv3d_neighbor_cache_{kw}x{kh}x{kd}_dilation{dilation}"
     neighbor_cache = x.get_spatial_cache(neighbor_cache_key) if hasattr(x, "get_spatial_cache") else None
     spatial_shape = torch_mod.Size([*x.shape, *x.spatial_shape])
-    cpu_slices: list[tuple[int, int, Any]] = []
+    staged_slices: list[tuple[int, int, Any]] = []
 
-    c0 = 0
-    while c0 < co:
-        c1 = min(c0 + c_step, co)
-        w_s = w_all[c0:c1].contiguous()
-        b_s = None if b_all is None else b_all[c0:c1].contiguous()
-        try:
-            out_s, nc_ = grouped_fn(
-                x.feats,
-                x.coords,
-                spatial_shape,
-                w_s,
-                b_s,
-                neighbor_cache,
-                dilation,
-            )
-        except RuntimeError as exc:
+    try:
+        c0 = 0
+        while c0 < co:
+            c1 = min(c0 + c_step, co)
+            w_s = w_all[c0:c1].contiguous()
+            b_s = None if b_all is None else b_all[c0:c1].contiguous()
+            try:
+                out_s, nc_ = grouped_fn(
+                    x.feats,
+                    x.coords,
+                    spatial_shape,
+                    w_s,
+                    b_s,
+                    neighbor_cache,
+                    dilation,
+                )
+            except RuntimeError as exc:
+                del w_s, b_s
+                if not _is_cuda_oom_msg(exc) or c_step <= min_c_step:
+                    raise
+                if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+                    torch_mod.cuda.empty_cache()
+                next_step = max(min_c_step, (c_step // 2) // min_c_step * min_c_step)
+                if next_step >= c_step:
+                    raise
+                log.warning(
+                    "Chunked SubMConv3d slice OOM at c_step=%d (N=%d, Co=%d); retrying with c_step=%d",
+                    c_step,
+                    n,
+                    co,
+                    next_step,
+                )
+                c_step = next_step
+                continue
+
             del w_s, b_s
-            if not _is_cuda_oom_msg(exc) or c_step <= min_c_step:
-                raise
-            if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
-                torch_mod.cuda.empty_cache()
-            next_step = max(min_c_step, (c_step // 2) // min_c_step * min_c_step)
-            if next_step >= c_step:
-                raise
-            log.warning(
-                "Chunked SubMConv3d slice OOM at c_step=%d (N=%d, Co=%d); retrying with c_step=%d",
-                c_step,
-                n,
-                co,
-                next_step,
-            )
-            c_step = next_step
-            continue
+            if neighbor_cache is None and nc_ is not None:
+                neighbor_cache = nc_
+                if hasattr(x, "register_spatial_cache"):
+                    x.register_spatial_cache(neighbor_cache_key, neighbor_cache)
 
-        if neighbor_cache is None and nc_ is not None:
-            neighbor_cache = nc_
-            if hasattr(x, "register_spatial_cache"):
-                x.register_spatial_cache(neighbor_cache_key, neighbor_cache)
-        # Contiguous D2H bulk DMA transfer (avoids slow strided column scatter on CPU)
-        sl_cpu = out_s.cpu() if hasattr(out_s, "cpu") else out_s.clone()
-        del out_s, w_s, b_s
-        cpu_slices.append((c0, c1, sl_cpu))
-        c0 = c1
+            if is_cuda and c1 == co:
+                # Final slice stays directly on GPU — zero host RAM, zero disk IO, zero H2D transfer
+                staged_slices.append((c0, c1, out_s))
+            else:
+                staged = _stage_tensor_off_gpu(out_s, torch_mod)
+                del out_s
+                staged_slices.append((c0, c1, staged))
+            c0 = c1
+    except BaseException:
+        _release_staged_slices(staged_slices)
+        raise
 
-    return cpu_slices
+    return staged_slices
 
 
 def _chunked_subm_conv3d_to_cpu(
@@ -468,9 +733,18 @@ def _chunked_subm_conv3d_to_cpu(
     slices = _chunked_subm_conv3d_slices_to_cpu(conv_mod, x, torch_mod, max_slice_bytes=max_slice_bytes)
     if slices is None:
         return None
-    if len(slices) == 1:
-        return slices[0][2]
-    return torch_mod.cat([sl for _, _, sl in slices], dim=1)
+    try:
+        cpu_parts = []
+        for _c0, _c1, sl in slices:
+            if isinstance(sl, _DiskMmapTensor):
+                cpu_parts.append(sl.tensor.clone())
+            elif hasattr(sl, "cpu"):
+                cpu_parts.append(sl.cpu())
+            else:
+                cpu_parts.append(sl)
+        return cpu_parts[0] if len(cpu_parts) == 1 else torch_mod.cat(cpu_parts, dim=1)
+    finally:
+        _release_staged_slices(slices)
 
 
 def _copy_cpu_slices_into_gpu_feats(
@@ -478,13 +752,31 @@ def _copy_cpu_slices_into_gpu_feats(
     cpu_slices: list[tuple[int, int, Any]],
     step: int,
 ) -> None:
-    """Stream contiguous CPU channel slices back into ``feats[:, c0:c1]`` on GPU."""
+    """Stream staged channel slices back into ``feats[:, c0:c1]`` on GPU and immediately free each slice."""
     n = int(feats.shape[0])
     dev = feats.device
-    for c0, c1, sl_cpu in cpu_slices:
-        for s in range(0, n, step):
-            e = min(s + step, n)
-            feats[s:e, c0:c1].copy_(sl_cpu[s:e].to(dev, non_blocking=True))
+    try:
+        # Write GPU-resident slices first so their GPU memory is released before streaming off-GPU slices
+        order = sorted(
+            range(len(cpu_slices)),
+            key=lambda idx: 0 if bool(getattr(cpu_slices[idx][2], "is_cuda", False)) else 1,
+        )
+        for idx in order:
+            c0, c1, sl_obj = cpu_slices[idx]
+            if bool(getattr(sl_obj, "is_cuda", False)) and sl_obj.device == dev:
+                feats[:, c0:c1].copy_(sl_obj)
+            else:
+                for s in range(0, n, step):
+                    e = min(s + step, n)
+                    chunk = sl_obj[s:e]
+                    if getattr(chunk, "device", None) != dev:
+                        chunk = chunk.to(dev, non_blocking=True)
+                    feats[s:e, c0:c1].copy_(chunk)
+                    del chunk
+            _release_staged_obj(sl_obj)
+            cpu_slices[idx] = (c0, c1, None)
+    finally:
+        _release_staged_slices(cpu_slices)
 
 
 def patch_sparse_convnext_block(
@@ -562,21 +854,30 @@ def patch_sparse_convnext_block(
 
         if cpu_slices is not None:
             dev = x_feats.device
-            for s in range(0, n, step):
-                e = min(s + step, n)
-                if len(cpu_slices) == 1:
-                    sub = cpu_slices[0][2][s:e].to(dev, non_blocking=True)
-                else:
-                    sub = torch_mod.cat(
-                        [sl_cpu[s:e].to(dev, non_blocking=True) for _, _, sl_cpu in cpu_slices],
-                        dim=1,
-                    )
-                sub = self.norm(sub)
-                sub = self.mlp[0](sub)
-                f_mod.silu(sub, inplace=True)
-                sub = self.mlp[2](sub)
-                x_feats[s:e].add_(sub)
-                del sub
+            try:
+                for s in range(0, n, step):
+                    e = min(s + step, n)
+                    if len(cpu_slices) == 1:
+                        sl0 = cpu_slices[0][2]
+                        c_part = sl0[s:e]
+                        sub = c_part if getattr(c_part, "device", None) == dev else c_part.to(dev, non_blocking=True)
+                    else:
+                        parts = []
+                        for _, _, sl_obj in cpu_slices:
+                            c_part = sl_obj[s:e]
+                            parts.append(
+                                c_part if getattr(c_part, "device", None) == dev else c_part.to(dev, non_blocking=True)
+                            )
+                        sub = torch_mod.cat(parts, dim=1)
+                        del parts
+                    sub = self.norm(sub)
+                    sub = self.mlp[0](sub)
+                    f_mod.silu(sub, inplace=True)
+                    sub = self.mlp[2](sub)
+                    x_feats[s:e].add_(sub)
+                    del sub
+            finally:
+                _release_staged_slices(cpu_slices)
             del cpu_slices
             return x
 
@@ -1064,7 +1365,7 @@ def patch_sparse_c2s_block(
                 or (n_in >= 500_000 and free_gb is not None and free_gb < VRAM_SAFETY_FLOOR_GB + 6.0)
             )
         )
-        x_feats_saved = x.feats.cpu() if offload_skip else x.feats
+        x_feats_saved = _stage_tensor_off_gpu(x.feats, torch_mod) if offload_skip else x.feats
 
         h = x.replace(normed)
         del x, normed
@@ -1181,8 +1482,8 @@ def patch_sparse_c2s_block(
         if flat_idx_saved is None:
             flat_idx_saved = flat_idx
         if is_cuda_x and n_out >= 1_500_000:
-            if not offload_skip and hasattr(x_feats_saved, "cpu"):
-                x_feats_saved = x_feats_saved.cpu()
+            if not offload_skip:
+                x_feats_saved = _stage_tensor_off_gpu(x_feats_saved, torch_mod)
                 offload_skip = True
             if not offload_flat_idx and flat_idx_saved is not None and hasattr(flat_idx_saved, "cpu"):
                 if sub_ret is not None and getattr(sub_ret, "_c2s_gather_cache", None) is not None:
@@ -1232,7 +1533,17 @@ def patch_sparse_c2s_block(
             _copy_cpu_slices_into_gpu_feats(h.feats, conv2_slices_cpu, step)
             del conv2_slices_cpu
 
-        x_skip_feats = x_feats_saved.to(h.device, non_blocking=True) if offload_skip else x_feats_saved
+        # At 1536^3 (n_out >= 10M), stage 4 has 0 blocks so h's ~6.5 GiB neighbor_cache is dead immediately
+        # after conv2; releasing it now gives ample VRAM before streaming x_skip_feats back onto GPU.
+        if is_cuda_x and n_out >= 10_000_000 and hasattr(h, "clear_spatial_cache"):
+            h.clear_spatial_cache()
+            torch_mod.cuda.empty_cache()
+
+        try:
+            x_skip_feats = x_feats_saved.to(h.device, non_blocking=True) if offload_skip else x_feats_saved
+        finally:
+            if offload_skip:
+                _release_staged_obj(x_feats_saved)
         del x_feats_saved
         rep = self.out_channels // (self.channels // 8)
 
@@ -3689,13 +4000,28 @@ class VRAMModelManager:
         self._pipeline = pipeline
         self._torch = torch_mod
         self._vram_gb = vram_gb
+        host_lim_gb, host_avail_gb = _host_ram_stats_gb()
+        pin_mode = os.environ.get("TRELLIS2_PIN_MEMORY", "auto").strip().lower()
+        # Pinning 15+ GiB of offloaded DiT weights in PyTorch's CachingHostAllocator permanently locks
+        # unswappable pages and triggers Docker cgroup OOM kills (exit 137) on 24–48 GB containers.
+        # Only enable page-locking when explicitly forced (1) or on >=64 GiB host cgroups.
+        want_pin = pin_mode in {"1", "true", "yes", "on"} or (
+            pin_mode == "auto" and host_lim_gb is not None and host_lim_gb >= 64.0
+        )
         self._pin_enabled = bool(
             enable_pin_memory
             and os.name != "nt"
-            and os.environ.get("TRELLIS2_PIN_MEMORY", "1") != "0"
+            and want_pin
             and torch_mod is not None
             and torch_mod.cuda.is_available()
         )
+        if host_lim_gb is not None or host_avail_gb is not None:
+            log.info(
+                "Detected Host/cgroup RAM: limit=%s GiB, available=%s GiB (pin_memory=%s)",
+                f"{host_lim_gb:.2f}" if host_lim_gb is not None else "unlimited",
+                f"{host_avail_gb:.2f}" if host_avail_gb is not None else "unknown",
+                self._pin_enabled,
+            )
         self._models: dict[str, Any] = {}
         for name, mod in (getattr(pipeline, "models", {}) or {}).items():
             if mod is not None:
