@@ -340,6 +340,153 @@ def _make_compiled_pointwise(fn: Callable[..., Any], torch_mod: Any) -> Callable
         return fn
 
 
+def _is_cuda_oom_msg(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cudaerrormemoryallocation" in msg
+
+
+def _chunked_subm_conv3d_slices_to_cpu(
+    conv_mod: Any,
+    x: Any,
+    torch_mod: Any,
+    max_slice_bytes: int | None = None,
+) -> list[tuple[int, int, Any]] | None:
+    """Run SparseConv3d in output-channel slices copied to contiguous CPU buffers via bulk DMA.
+
+    Returns ``[(c0, c1, slice_cpu), ...]`` where each ``slice_cpu`` is contiguous ``(N, c1 - c0)``
+    on CPU RAM (~20x faster than scattering into a strided ``(N, Co)`` CPU matrix).
+    Bit-exact: reuses a single FlexGEMM ``neighbor_cache`` across all slices and halves ``c_step``
+    automatically on CUDA OOM.
+    """
+    w_all = getattr(conv_mod, "weight", None)
+    b_all = getattr(conv_mod, "bias", None)
+    if w_all is None or getattr(w_all, "ndim", 0) != 5:
+        return None
+    n = int(x.feats.shape[0])
+    co, kd, kh, kw, _ci = (int(d) for d in w_all.shape)
+    if n <= 0 or co <= 0:
+        return None
+
+    grouped_fn = getattr(conv_mod, "_grouped_conv_fn", None)
+    dilation = getattr(conv_mod, "dilation", (1, 1, 1))
+    if grouped_fn is None:
+        if not bool(getattr(x.feats, "is_cuda", False)):
+            return None
+        try:
+            import flex_gemm  # type: ignore[import-not-found]
+            from flex_gemm.ops.spconv import sparse_submanifold_conv3d  # type: ignore[import-not-found]
+            from trellis2.modules.sparse.conv import config as conv_cfg  # type: ignore[import-not-found]
+        except Exception:
+            return None
+        if getattr(conv_cfg, "CONV", "flex_gemm") != "flex_gemm":
+            return None
+        flex_gemm.ops.spconv.set_algorithm(conv_cfg.FLEX_GEMM_ALGO)
+        flex_gemm.ops.spconv.set_hashmap_ratio(conv_cfg.FLEX_GEMM_HASHMAP_RATIO)
+        grouped_fn = sparse_submanifold_conv3d
+
+    elem_size = int(x.feats.element_size())
+    if max_slice_bytes is None:
+        free_gb = _cuda_free_gb(torch_mod) if bool(getattr(x.feats, "is_cuda", False)) else None
+        if free_gb is not None:
+            # Target <=40% of currently free VRAM (clamped to 256 MiB .. 1.5 GiB)
+            max_slice_bytes = int(min(1.5 * (1024**3), max(256 * (1024**2), free_gb * 0.40 * (1024**3))))
+        else:
+            max_slice_bytes = 1024**3
+
+    min_c_step = 16 if co >= 16 and co % 16 == 0 else 1
+    raw_c_step = max(min_c_step, int(max_slice_bytes // max(1, n * elem_size)))
+    if min_c_step == 16:
+        c_step = max(16, (raw_c_step // 16) * 16)
+    else:
+        c_step = max(1, raw_c_step)
+    c_step = min(co, c_step)
+    if c_step >= co and co >= 32:
+        c_step = max(min_c_step, co // 2)
+
+    if bool(getattr(x.feats, "is_cuda", False)) and hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+        torch_mod.cuda.empty_cache()
+
+    neighbor_cache_key = f"SubMConv3d_neighbor_cache_{kw}x{kh}x{kd}_dilation{dilation}"
+    neighbor_cache = x.get_spatial_cache(neighbor_cache_key) if hasattr(x, "get_spatial_cache") else None
+    spatial_shape = torch_mod.Size([*x.shape, *x.spatial_shape])
+    cpu_slices: list[tuple[int, int, Any]] = []
+
+    c0 = 0
+    while c0 < co:
+        c1 = min(c0 + c_step, co)
+        w_s = w_all[c0:c1].contiguous()
+        b_s = None if b_all is None else b_all[c0:c1].contiguous()
+        try:
+            out_s, nc_ = grouped_fn(
+                x.feats,
+                x.coords,
+                spatial_shape,
+                w_s,
+                b_s,
+                neighbor_cache,
+                dilation,
+            )
+        except RuntimeError as exc:
+            del w_s, b_s
+            if not _is_cuda_oom_msg(exc) or c_step <= min_c_step:
+                raise
+            if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+                torch_mod.cuda.empty_cache()
+            next_step = max(min_c_step, (c_step // 2) // min_c_step * min_c_step)
+            if next_step >= c_step:
+                raise
+            log.warning(
+                "Chunked SubMConv3d slice OOM at c_step=%d (N=%d, Co=%d); retrying with c_step=%d",
+                c_step,
+                n,
+                co,
+                next_step,
+            )
+            c_step = next_step
+            continue
+
+        if neighbor_cache is None and nc_ is not None:
+            neighbor_cache = nc_
+            if hasattr(x, "register_spatial_cache"):
+                x.register_spatial_cache(neighbor_cache_key, neighbor_cache)
+        # Contiguous D2H bulk DMA transfer (avoids slow strided column scatter on CPU)
+        sl_cpu = out_s.cpu() if hasattr(out_s, "cpu") else out_s.clone()
+        del out_s, w_s, b_s
+        cpu_slices.append((c0, c1, sl_cpu))
+        c0 = c1
+
+    return cpu_slices
+
+
+def _chunked_subm_conv3d_to_cpu(
+    conv_mod: Any,
+    x: Any,
+    torch_mod: Any,
+    max_slice_bytes: int | None = None,
+) -> Any | None:
+    """Return a single ``(N, Co)`` CPU tensor from ``_chunked_subm_conv3d_slices_to_cpu``."""
+    slices = _chunked_subm_conv3d_slices_to_cpu(conv_mod, x, torch_mod, max_slice_bytes=max_slice_bytes)
+    if slices is None:
+        return None
+    if len(slices) == 1:
+        return slices[0][2]
+    return torch_mod.cat([sl for _, _, sl in slices], dim=1)
+
+
+def _copy_cpu_slices_into_gpu_feats(
+    feats: Any,
+    cpu_slices: list[tuple[int, int, Any]],
+    step: int,
+) -> None:
+    """Stream contiguous CPU channel slices back into ``feats[:, c0:c1]`` on GPU."""
+    n = int(feats.shape[0])
+    dev = feats.device
+    for c0, c1, sl_cpu in cpu_slices:
+        for s in range(0, n, step):
+            e = min(s + step, n)
+            feats[s:e, c0:c1].copy_(sl_cpu[s:e].to(dev, non_blocking=True))
+
+
 def patch_sparse_convnext_block(
     convnext_cls: Any,
     f_mod: Any,
@@ -370,15 +517,74 @@ def patch_sparse_convnext_block(
     compile_state = {"failed": False}
 
     def _chunked_convnext_forward(self: Any, x: Any) -> Any:
-        h = self.conv(x)
-        feats = h.feats
         x_feats = x.feats
-        n = feats.shape[0]
+        n = int(x_feats.shape[0])
+        is_cuda = bool(getattr(x_feats, "is_cuda", False))
         step = _effective_voxel_chunk(torch_mod, chunk_size)
+
+        cpu_slices = None
+        h = None
+        w_conv = getattr(self.conv, "weight", None)
+        co = int(w_conv.shape[0]) if w_conv is not None and getattr(w_conv, "ndim", 0) == 5 else int(x_feats.shape[-1])
+        est_out_bytes = n * co * int(x_feats.element_size())
+        want_chunked_conv = False
+        if is_cuda and torch_mod is not None and est_out_bytes >= 1024**3:
+            free_gb = _cuda_free_gb(torch_mod)
+            if free_gb is not None and (free_gb * (1024**3)) < (est_out_bytes + int(0.75 * (1024**3))):
+                want_chunked_conv = True
+
+        if want_chunked_conv:
+            log.info(
+                "Using output-channel chunked SubMConv3d in ConvNeXt block (N=%d, Co=%d, est_out=%.2f GiB)",
+                n,
+                co,
+                est_out_bytes / (1024**3),
+            )
+            cpu_slices = _chunked_subm_conv3d_slices_to_cpu(self.conv, x, torch_mod)
+
+        if cpu_slices is None:
+            try:
+                h = self.conv(x)
+            except RuntimeError as exc:
+                if not (is_cuda and torch_mod is not None and _is_cuda_oom_msg(exc)):
+                    raise
+                if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+                    torch_mod.cuda.empty_cache()
+                log.warning(
+                    "ConvNeXt SubMConv3d OOM (N=%d, Co=%d, est_out=%.2f GiB); retrying with channel-chunked CPU staging",
+                    n,
+                    co,
+                    est_out_bytes / (1024**3),
+                )
+                cpu_slices = _chunked_subm_conv3d_slices_to_cpu(self.conv, x, torch_mod)
+                if cpu_slices is None:
+                    raise
+
+        if cpu_slices is not None:
+            dev = x_feats.device
+            for s in range(0, n, step):
+                e = min(s + step, n)
+                if len(cpu_slices) == 1:
+                    sub = cpu_slices[0][2][s:e].to(dev, non_blocking=True)
+                else:
+                    sub = torch_mod.cat(
+                        [sl_cpu[s:e].to(dev, non_blocking=True) for _, _, sl_cpu in cpu_slices],
+                        dim=1,
+                    )
+                sub = self.norm(sub)
+                sub = self.mlp[0](sub)
+                f_mod.silu(sub, inplace=True)
+                sub = self.mlp[2](sub)
+                x_feats[s:e].add_(sub)
+                del sub
+            del cpu_slices
+            return x
+
+        feats = h.feats
         use_fused = (
             not compile_state["failed"]
             and compiled_pointwise is not _convnext_pointwise_eager
-            and bool(getattr(feats, "is_cuda", False))
+            and is_cuda
             and hasattr(self.norm, "eps")
             and hasattr(self.mlp[0], "weight")
             and hasattr(self.mlp[2], "weight")
@@ -412,6 +618,120 @@ def patch_sparse_convnext_block(
 
     convnext_cls._forward = _chunked_convnext_forward
     convnext_cls._trellis2_vram_patched = True
+
+
+def patch_sparse_res_block(
+    res_cls: Any,
+    torch_mod: Any,
+    f_mod: Any,
+    chunk_size: int = DEFAULT_VOXEL_CHUNK_SIZE,
+) -> None:
+    """Chunk pointwise Norm + SiLU + residual add and add channel-chunked SubMConv3d fallback in SparseResBlock3d."""
+    if res_cls is None or getattr(res_cls, "_trellis2_vram_patched", False):
+        return
+    orig_forward = res_cls._forward
+
+    def _run_conv_low_vram(conv_mod: Any, sp_in: Any, step: int) -> Any:
+        n = int(sp_in.feats.shape[0])
+        is_cuda = bool(getattr(sp_in.feats, "is_cuda", False))
+        w_conv = getattr(conv_mod, "weight", None)
+        co = int(w_conv.shape[0]) if w_conv is not None and getattr(w_conv, "ndim", 0) == 5 else int(sp_in.feats.shape[-1])
+        est_bytes = n * co * int(sp_in.feats.element_size())
+        cpu_slices = None
+        if is_cuda and est_bytes >= 1024**3:
+            free_gb = _cuda_free_gb(torch_mod)
+            if free_gb is not None and (free_gb * (1024**3)) < (est_bytes + int(0.75 * (1024**3))):
+                cpu_slices = _chunked_subm_conv3d_slices_to_cpu(conv_mod, sp_in, torch_mod)
+        if cpu_slices is None:
+            try:
+                return conv_mod(sp_in)
+            except RuntimeError as exc:
+                if not (is_cuda and _is_cuda_oom_msg(exc)):
+                    raise
+                if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+                    torch_mod.cuda.empty_cache()
+                cpu_slices = _chunked_subm_conv3d_slices_to_cpu(conv_mod, sp_in, torch_mod)
+                if cpu_slices is None:
+                    raise
+        if co == int(sp_in.feats.shape[-1]):
+            _copy_cpu_slices_into_gpu_feats(sp_in.feats, cpu_slices, step)
+            del cpu_slices
+            return sp_in
+        dev = sp_in.feats.device
+        dtype = sp_in.feats.dtype
+        out_sp = sp_in.replace(torch_mod.empty((0, co), dtype=dtype, device=dev))
+        del sp_in
+        if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
+            torch_mod.cuda.empty_cache()
+        out_feats = torch_mod.empty((n, co), dtype=dtype, device=dev)
+        _copy_cpu_slices_into_gpu_feats(out_feats, cpu_slices, step)
+        del cpu_slices
+        return out_sp.replace(out_feats)
+
+    def _chunked_res_forward(self: Any, x: Any) -> Any:
+        if (
+            getattr(self, "training", False)
+            or getattr(self, "downsample", False)
+            or getattr(self, "upsample", False)
+            or getattr(self, "resample_mode", "nearest") != "nearest"
+        ):
+            return orig_forward(self, x)
+
+        n = int(x.feats.shape[0])
+        is_cuda = bool(getattr(x.feats, "is_cuda", False))
+        step = _effective_voxel_chunk(torch_mod, chunk_size)
+        offload_skip = bool(is_cuda and n >= 1_000_000)
+        x_skip_saved = x.feats.cpu() if offload_skip else x.feats
+
+        normed = torch_mod.empty_like(x.feats)
+        for s in range(0, n, step):
+            e = min(s + step, n)
+            tmp = self.norm1(x.feats[s:e])
+            f_mod.silu(tmp, inplace=True)
+            normed[s:e].copy_(tmp)
+            del tmp
+        h = x.replace(normed)
+        del x, normed
+
+        h = _run_conv_low_vram(self.conv1, h, step)
+        for s in range(0, n, step):
+            e = min(s + step, n)
+            tmp = self.norm2(h.feats[s:e])
+            f_mod.silu(tmp, inplace=True)
+            h.feats[s:e].copy_(tmp)
+            del tmp
+        h = _run_conv_low_vram(self.conv2, h, step)
+
+        dev = h.feats.device
+        skip_mod = self.skip_connection
+        is_identity = type(skip_mod).__name__ == "Identity"
+        skip_linear = getattr(skip_mod, "weight", None) is not None and hasattr(skip_mod, "bias")
+        if is_identity or skip_linear:
+            w_sk = getattr(skip_mod, "weight", None)
+            b_sk = getattr(skip_mod, "bias", None)
+            for s in range(0, n, step):
+                e = min(s + step, n)
+                sk = x_skip_saved[s:e].to(dev, non_blocking=True) if offload_skip else x_skip_saved[s:e]
+                if skip_linear:
+                    sk = f_mod.linear(sk, w_sk, b_sk)
+                h.feats[s:e].add_(sk)
+                del sk
+            del x_skip_saved
+        else:
+            sk_gpu = x_skip_saved.to(dev, non_blocking=True) if offload_skip else x_skip_saved
+            del x_skip_saved
+            x_tmp = h.replace(sk_gpu)
+            del sk_gpu
+            sk_out = skip_mod(x_tmp)
+            del x_tmp
+            for s in range(0, n, step):
+                e = min(s + step, n)
+                h.feats[s:e].add_(sk_out.feats[s:e])
+            del sk_out
+        return h
+
+    res_cls._forward = _chunked_res_forward
+    res_cls._trellis2_vram_patched = True
 
 
 def _try_octant_grouped_c2s_conv1(
@@ -487,8 +807,11 @@ def _try_octant_grouped_c2s_conv1(
                 h.register_spatial_cache(neighbor_cache_key, neighbor_cache)
         if h_up_feats is None:
             h_up_feats = torch_mod.empty((n_out, out_ch), dtype=out_k.dtype, device=out_k.device)
-        h_up_feats[mask_k] = out_k[row_idx[mask_k]]
-        del out_k, mask_k
+        idx_k = row_idx[mask_k]
+        if idx_k.dtype != torch_mod.long:
+            idx_k = idx_k.long()
+        h_up_feats[mask_k] = out_k[idx_k]
+        del out_k, mask_k, idx_k
 
     if h_up_feats is None:
         h_up_feats = torch_mod.empty((0, out_ch), dtype=h.feats.dtype, device=h.feats.device)
@@ -754,22 +1077,35 @@ def patch_sparse_c2s_block(
         )
 
         flat_idx = None
+        flat_idx_saved = None
+        offload_flat_idx = False
+        use_i32_idx = bool(n_in * 8 < 2_147_483_647)
         if can_fast_c2s:
             if cached_gather is not None:
                 new_coords, flat_idx = cached_gather
                 cached_gather = None
                 row_idx = torch_mod.div(flat_idx, 8, rounding_mode="floor")
-                subidx = flat_idx - row_idx * 8
+                subidx = (flat_idx - row_idx * 8).to(torch_mod.uint8)
+                if use_i32_idx and row_idx.dtype != torch_mod.int32:
+                    row_idx = row_idx.int()
             else:
                 nz = subdiv_binarized.feats.nonzero()
-                row_idx = nz[:, 0]
-                subidx = nz[:, 1]
-                flat_idx = row_idx * 8 + subidx
-                new_coords = x_coords[row_idx].clone()
+                row_idx_l = nz[:, 0]
+                subidx_l = nz[:, 1]
+                new_coords = x_coords[row_idx_l].clone()
                 new_coords[:, 1:] *= 2
-                shifts = torch_mod.tensor([0, 1, 2], device=x_coords.device, dtype=subidx.dtype)
-                new_coords[:, 1:] += ((subidx[:, None] >> shifts) & 1).to(new_coords.dtype)
+                shifts = torch_mod.tensor([0, 1, 2], device=x_coords.device, dtype=subidx_l.dtype)
+                new_coords[:, 1:] += ((subidx_l[:, None] >> shifts) & 1).to(new_coords.dtype)
                 del nz, shifts
+                if use_i32_idx:
+                    row_idx = row_idx_l.int()
+                    subidx = subidx_l.to(torch_mod.uint8)
+                    del row_idx_l, subidx_l
+                    flat_idx = row_idx * 8 + subidx.int()
+                else:
+                    row_idx = row_idx_l
+                    subidx = subidx_l
+                    flat_idx = row_idx * 8 + subidx
                 if (
                     self.pred_subdiv
                     and sub_ret is not None
@@ -786,6 +1122,20 @@ def patch_sparse_c2s_block(
             )
             h_scale = getattr(h, "_scale", None)
 
+            # Spill flat_idx to CPU BEFORE conv1 on large upsamples so conv1 gets the extra ~220-430 MiB too
+            if (
+                is_cuda_x
+                and flat_idx is not None
+                and int(flat_idx.shape[0]) >= 1_500_000
+                and hasattr(flat_idx, "cpu")
+            ):
+                if sub_ret is not None and getattr(sub_ret, "_c2s_gather_cache", None) is not None:
+                    sub_ret._c2s_gather_cache = None
+                flat_idx_saved = flat_idx.cpu()
+                del flat_idx
+                flat_idx = None
+                offload_flat_idx = True
+
             h_up_feats = _try_octant_grouped_c2s_conv1(
                 self.conv1, h, row_idx, subidx, int(self.out_channels), torch_mod
             )
@@ -800,8 +1150,15 @@ def patch_sparse_c2s_block(
                     h.clear_spatial_cache()
                 h_feats_2d = h.feats.reshape(n_in * 8, -1)
                 del h
-                h_up_feats = h_feats_2d[flat_idx]
-                del h_feats_2d
+                gather_idx = (
+                    flat_idx_saved.to(h_feats_2d.device, non_blocking=True)
+                    if offload_flat_idx and flat_idx_saved is not None
+                    else flat_idx
+                )
+                if gather_idx.dtype != torch_mod.long:
+                    gather_idx = gather_idx.long()
+                h_up_feats = h_feats_2d[gather_idx]
+                del h_feats_2d, gather_idx
 
             h = sparse_tensor_cls(h_up_feats, new_coords, out_shape)
             if h_scale is not None:
@@ -821,13 +1178,13 @@ def patch_sparse_c2s_block(
             h.feats[s:e].copy_(tmp)
             del tmp
 
-        offload_flat_idx = False
-        flat_idx_saved = flat_idx
+        if flat_idx_saved is None:
+            flat_idx_saved = flat_idx
         if is_cuda_x and n_out >= 1_500_000:
             if not offload_skip and hasattr(x_feats_saved, "cpu"):
                 x_feats_saved = x_feats_saved.cpu()
                 offload_skip = True
-            if flat_idx_saved is not None and hasattr(flat_idx_saved, "cpu"):
+            if not offload_flat_idx and flat_idx_saved is not None and hasattr(flat_idx_saved, "cpu"):
                 if sub_ret is not None and getattr(sub_ret, "_c2s_gather_cache", None) is not None:
                     sub_ret._c2s_gather_cache = None
                 flat_idx_saved = flat_idx_saved.cpu()
@@ -839,7 +1196,41 @@ def patch_sparse_c2s_block(
             if free_pre_conv2 is not None and free_pre_conv2 < VRAM_SAFETY_FLOOR_GB + 6.0:
                 torch_mod.cuda.empty_cache()
 
-        h = self.conv2(h)
+        conv2_slices_cpu = None
+        est_conv2_bytes = n_out * int(self.out_channels) * int(h.feats.element_size())
+        if is_cuda_x and est_conv2_bytes >= 1024**3:
+            free_pre_conv2 = _cuda_free_gb(torch_mod)
+            if free_pre_conv2 is not None and (free_pre_conv2 * (1024**3)) < (
+                est_conv2_bytes + int(0.75 * (1024**3))
+            ):
+                log.info(
+                    "Using output-channel chunked SubMConv3d in C2S conv2 (N=%d, Co=%d, est_out=%.2f GiB)",
+                    n_out,
+                    int(self.out_channels),
+                    est_conv2_bytes / (1024**3),
+                )
+                conv2_slices_cpu = _chunked_subm_conv3d_slices_to_cpu(self.conv2, h, torch_mod)
+
+        if conv2_slices_cpu is None:
+            try:
+                h = self.conv2(h)
+            except RuntimeError as exc:
+                if not (is_cuda_x and _is_cuda_oom_msg(exc)):
+                    raise
+                torch_mod.cuda.empty_cache()
+                log.warning(
+                    "C2S conv2 SubMConv3d OOM (N=%d, Co=%d, est_out=%.2f GiB); retrying with channel-chunked CPU staging",
+                    n_out,
+                    int(self.out_channels),
+                    est_conv2_bytes / (1024**3),
+                )
+                conv2_slices_cpu = _chunked_subm_conv3d_slices_to_cpu(self.conv2, h, torch_mod)
+                if conv2_slices_cpu is None:
+                    raise
+
+        if conv2_slices_cpu is not None:
+            _copy_cpu_slices_into_gpu_feats(h.feats, conv2_slices_cpu, step)
+            del conv2_slices_cpu
 
         x_skip_feats = x_feats_saved.to(h.device, non_blocking=True) if offload_skip else x_feats_saved
         del x_feats_saved
@@ -855,6 +1246,8 @@ def patch_sparse_c2s_block(
                     if offload_flat_idx
                     else flat_idx_saved[s:e]
                 )
+                if idx_chunk.dtype != torch_mod.long:
+                    idx_chunk = idx_chunk.long()
                 skip_sub = x_skip_2d[idx_chunk]
                 del idx_chunk
                 if rep == 1:
@@ -1215,7 +1608,14 @@ def _chunked_fdg_to_mesh(
     )
     del quad_chunks
 
-    mesh_vertices = (coords.float() + dual_vertices) * voxel_size + aabb_t[0].reshape(1, 3)
+    mesh_vertices = torch_mod.empty((n, 3), dtype=torch_mod.float32, device=dev)
+    aabb_min = aabb_t[0].reshape(1, 3)
+    for s in range(0, n, edge_chunk):
+        e = min(s + edge_chunk, n)
+        mv = coords[s:e].to(torch_mod.float32)
+        mv.add_(dual_vertices[s:e]).mul_(voxel_size).add_(aabb_min)
+        mesh_vertices[s:e].copy_(mv)
+        del mv
 
     num_quads = int(quad_indices.shape[0])
     mesh_triangles = torch_mod.empty((num_quads * 2, 3), dtype=quad_indices.dtype, device=dev)
@@ -1268,6 +1668,8 @@ def patch_fdg_decoder(
         scale = 1.0 + 2.0 * margin
         for sl in layout:
             c_b = coords_all[sl, 1:].contiguous()
+            if len(layout) == 1:
+                del coords_all
             f_b = feats_all[sl]
             n_b = f_b.shape[0]
             v_f = torch_mod.empty((n_b, 3), dtype=f_b.dtype, device=f_b.device)
@@ -1283,7 +1685,7 @@ def patch_fdg_decoder(
                 del v_chunk
             del f_b
             if len(layout) == 1:
-                del coords_all, feats_all
+                del feats_all
                 free_gb = _cuda_free_gb(torch_mod)
                 if torch_mod.cuda.is_available() and (free_gb is None or free_gb < VRAM_SAFETY_FLOOR_GB + 1.0):
                     torch_mod.cuda.empty_cache()
@@ -3671,6 +4073,7 @@ def install_trellis2_vram_optimizations(
     import torch.nn.functional as f_mod
     from o_voxel.convert import flexible_dual_grid_to_mesh
     from trellis2.models.sc_vaes.fdg_vae import FlexiDualGridVaeDecoder
+    import trellis2.models.sc_vaes.sparse_unet_vae as sparse_unet_vae_mod
     from trellis2.models.sc_vaes.sparse_unet_vae import (
         SparseConvNeXtBlock3d,
         SparseResBlockC2S3d,
@@ -3711,6 +4114,12 @@ def install_trellis2_vram_optimizations(
         log.debug("Skipping FlexGEMM neighbor cache patch: %s", exc)
     patch_sparse_convnext_block(
         SparseConvNeXtBlock3d, f_mod, DEFAULT_VOXEL_CHUNK_SIZE, torch_mod=torch_mod
+    )
+    patch_sparse_res_block(
+        getattr(sparse_unet_vae_mod, "SparseResBlock3d", None),
+        torch_mod,
+        f_mod,
+        DEFAULT_VOXEL_CHUNK_SIZE,
     )
     patch_sparse_c2s_block(
         SparseResBlockC2S3d, SparseTensor, torch_mod, f_mod, DEFAULT_VOXEL_CHUNK_SIZE
@@ -4487,7 +4896,10 @@ class Trellis2Engine:
             v = tex_voxels[0]
             del tex_voxels
             free_gb = _cuda_free_gb(torch)
-            spill_voxels = bool(free_gb is not None and free_gb < (floor + 1.5))
+            stage_bake_cpu = os.environ.get("TRELLIS2_STAGE_BAKE_VOLUME_CPU", "1") != "0"
+            spill_voxels = bool(
+                (res > 1024 and stage_bake_cpu) or (free_gb is not None and free_gb < (floor + 1.5))
+            )
             v_coords = v.coords[:, 1:].cpu() if spill_voxels else v.coords[:, 1:].contiguous()
             v_attrs = v.feats.cpu() if spill_voxels else v.feats.contiguous()
             v_shape = torch.Size([*v.shape, *v.spatial_shape])
