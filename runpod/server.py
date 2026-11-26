@@ -19,14 +19,27 @@ os.environ.setdefault(
 
 
 def _configure_persistent_kernel_caches() -> None:
-    """Point Triton and FlexGEMM autotune caches to persistent RunPod storage before imports."""
+    """Point Triton and FlexGEMM autotune caches to writable storage without starving 20 GB volumes."""
     storage_root: Path | None = None
+    min_volume_free_bytes = int(1.5 * (1024**3))
     for candidate in ("/runpod-volume", "/workspace"):
         p = Path(candidate)
-        if p.is_dir() and os.access(p, os.W_OK):
-            storage_root = p
-            break
-    cache_base = storage_root if storage_root is not None else Path(tempfile.gettempdir())
+        if not (p.is_dir() and os.access(p, os.W_OK)):
+            continue
+        if candidate == "/runpod-volume":
+            try:
+                if shutil.disk_usage(p).free < min_volume_free_bytes:
+                    continue
+            except OSError:
+                continue
+        storage_root = p
+        break
+    if storage_root is not None:
+        cache_base = storage_root
+    elif Path("/var/tmp").is_dir() and os.access("/var/tmp", os.W_OK):
+        cache_base = Path("/var/tmp") / "trellis2_cache"
+    else:
+        cache_base = Path(tempfile.gettempdir())
     triton_dir = Path(os.environ.setdefault("TRITON_CACHE_DIR", str(cache_base / "triton_cache")))
     try:
         triton_dir.mkdir(parents=True, exist_ok=True)
@@ -39,31 +52,116 @@ def _configure_persistent_kernel_caches() -> None:
     os.environ.setdefault("FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE", "1")
 
 
+def _cleanup_stale_mmap_files() -> None:
+    """Remove any leftover trellis2_stage_*.bin mmap scratch files from prior crashed runs."""
+    candidates = [
+        Path(os.environ.get("TRELLIS2_MMAP_DIR", "").strip()) if os.environ.get("TRELLIS2_MMAP_DIR", "").strip() else None,
+        Path("/var/tmp"),
+        Path("/tmp"),
+        Path(tempfile.gettempdir()),
+        Path("/workspace/.trellis2_mmap"),
+        Path("/runpod-volume/.trellis2_mmap"),
+    ]
+    seen: set[str] = set()
+    for base in candidates:
+        if base is None or not base.is_dir():
+            continue
+        key = str(base)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            for p in base.glob("trellis2_stage_*.bin"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+def _is_already_patched(target: Any, attr: str = "_trellis2_vram_patched") -> bool:
+    """Check patching flag on target's own __dict__ so MRO inheritance never skips subclass patches."""
+    try:
+        return bool(vars(target).get(attr, False))
+    except TypeError:
+        return bool(getattr(target, attr, False))
+
+
+def patch_flex_gemm_autotune_cache_safety() -> int:
+    """Make FlexGEMM autotune cache saves non-fatal on Disk quota exceeded (EDQUOT) / ENOSPC."""
+    mod_names = (
+        "flex_gemm.utils.autotuner",
+        "flex_gemm.ops.spconv",
+        "flex_gemm.kernels.triton.spconv.config",
+        "flex_gemm.autotuner",
+        "flex_gemm.autotune",
+    )
+    fn_names = ("save_autotune_cache", "dump_autotune_cache", "save_cache")
+    patched = 0
+    for mod_name in mod_names:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+        for fn_name in fn_names:
+            orig_fn = getattr(mod, fn_name, None)
+            if not callable(orig_fn) or getattr(orig_fn, "_trellis2_nonfatal_cache_save", False):
+                continue
+
+            def _safe_save(*args: Any, _orig: Callable[..., Any] = orig_fn, _name: str = f"{mod_name}.{fn_name}", **kwargs: Any) -> Any:
+                try:
+                    return _orig(*args, **kwargs)
+                except OSError as exc:
+                    cache_path = os.environ.get("FLEX_GEMM_AUTOTUNE_CACHE_PATH", "")
+                    if cache_path:
+                        try:
+                            tmp_p = Path(cache_path + ".tmp")
+                            if tmp_p.exists():
+                                tmp_p.unlink()
+                        except OSError:
+                            pass
+                    logging.getLogger("trellis2.server").warning(
+                        "Skipping FlexGEMM autotune cache save (%s): %s", _name, exc
+                    )
+                    return None
+                except Exception as exc:
+                    logging.getLogger("trellis2.server").warning(
+                        "Skipping FlexGEMM autotune cache save (%s): %s", _name, exc
+                    )
+                    return None
+
+            _safe_save._trellis2_nonfatal_cache_save = True  # type: ignore[attr-defined]
+            setattr(mod, fn_name, _safe_save)
+            patched += 1
+    return patched
+
+
 def _flush_flex_gemm_autotune_cache() -> None:
     """Best-effort immediate flush of FlexGEMM Triton autotune cache to persistent storage."""
-    try:
-        import flex_gemm.ops.spconv as _spconv  # type: ignore[import-not-found]
-    except Exception:
-        return
-    for fn_name in ("save_autotune_cache", "dump_autotune_cache"):
-        fn = getattr(_spconv, fn_name, None)
-        if callable(fn):
-            try:
-                fn()
-                return
-            except Exception:
-                pass
-    try:
-        from flex_gemm.kernels.triton.spconv import config as _triton_cfg  # type: ignore[import-not-found]
-
-        save_fn = getattr(_triton_cfg, "save_autotune_cache", None)
-        if callable(save_fn):
-            save_fn()
-    except Exception:
-        pass
+    for mod_name in (
+        "flex_gemm.utils.autotuner",
+        "flex_gemm.ops.spconv",
+        "flex_gemm.kernels.triton.spconv.config",
+    ):
+        try:
+            mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+        except Exception:
+            continue
+        for fn_name in ("save_autotune_cache", "dump_autotune_cache", "save_cache"):
+            fn = getattr(mod, fn_name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    return
+                except Exception:
+                    pass
 
 
 import gc
+import importlib
 import inspect
 import io
 import itertools
@@ -72,6 +170,7 @@ import logging
 import re
 import secrets
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -85,6 +184,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
 _configure_persistent_kernel_caches()
+_cleanup_stale_mmap_files()
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse
@@ -297,7 +397,7 @@ def patch_layernorm32(
     chunk_size: int = DEFAULT_VOXEL_CHUNK_SIZE,
 ) -> None:
     """Chunk LayerNorm32 along voxel rows to prevent multi-GiB float32 upcast spikes."""
-    if getattr(layernorm_cls, "_trellis2_vram_patched", False):
+    if _is_already_patched(layernorm_cls, "_trellis2_vram_patched"):
         return
     orig_forward = layernorm_cls.forward
 
@@ -450,21 +550,31 @@ def _choose_mmap_scratch_dir(min_free_bytes: int = 2 * (1024**3)) -> Path:
             pass
         return any(resolved == m or resolved.startswith(m + "/") for m in tmpfs_mounts if m != "/")
 
-    candidates: list[Path] = []
+    candidates: list[tuple[Path, int]] = []
     env_dir = os.environ.get("TRELLIS2_MMAP_DIR", "").strip()
     if env_dir:
-        candidates.append(Path(env_dir))
-    for root in (Path("/runpod-volume"), Path("/workspace"), Path("/var/tmp")):
-        if root.is_dir():
-            candidates.append(root / ".trellis2_mmap" if str(root) != "/var/tmp" else root)
-    candidates.append(Path(tempfile.gettempdir()))
+        candidates.append((Path(env_dir), 0))
+    # Prefer ephemeral container local disk (/var/tmp, /tmp when non-tmpfs) before persistent volumes
+    # so large intermediate mmap staging never fills a tight 20 GB /runpod-volume network volume.
+    for local_dir in (Path("/var/tmp"), Path("/tmp"), Path(tempfile.gettempdir())):
+        if local_dir.is_dir():
+            candidates.append((local_dir, 0))
+    if Path("/workspace").is_dir():
+        candidates.append((Path("/workspace/.trellis2_mmap"), 1 * (1024**3)))
+    if Path("/runpod-volume").is_dir():
+        candidates.append((Path("/runpod-volume/.trellis2_mmap"), 4 * (1024**3)))
 
-    for cand in candidates:
+    seen: set[str] = set()
+    for cand, reserve_bytes in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             if _is_tmpfs_path(cand):
                 continue
             cand.mkdir(parents=True, exist_ok=True)
-            if os.access(cand, os.W_OK) and shutil.disk_usage(cand).free >= min_free_bytes:
+            if os.access(cand, os.W_OK) and shutil.disk_usage(cand).free >= (min_free_bytes + reserve_bytes):
                 return cand
         except Exception:
             continue
@@ -829,7 +939,7 @@ def patch_sparse_convnext_block(
     requires >18 GiB of temporary tensors; adaptive 256K..2M-voxel chunks eliminate
     OOM while maximizing Tensor Core GEMM throughput with bit-identical outputs.
     """
-    if getattr(convnext_cls, "_trellis2_vram_patched", False):
+    if _is_already_patched(convnext_cls, "_trellis2_vram_patched"):
         return
 
     def _convnext_pointwise_eager(
@@ -972,7 +1082,7 @@ def patch_sparse_res_block(
     chunk_size: int = DEFAULT_VOXEL_CHUNK_SIZE,
 ) -> None:
     """Chunk pointwise Norm + SiLU + residual add and add channel-chunked SubMConv3d fallback in SparseResBlock3d."""
-    if res_cls is None or getattr(res_cls, "_trellis2_vram_patched", False):
+    if res_cls is None or _is_already_patched(res_cls, "_trellis2_vram_patched"):
         return
     orig_forward = res_cls._forward
 
@@ -1187,7 +1297,7 @@ def patch_flex_gemm_neighbor_cache(
     cache_cls = getattr(subm_mod, "SubMConv3dNeighborCache", None)
     if subm_fn_cls is None or cache_cls is None:
         return
-    if getattr(subm_fn_cls, "_trellis2_vram_patched", False):
+    if _is_already_patched(subm_fn_cls, "_trellis2_vram_patched"):
         return
 
     alg_cls = getattr(subm_mod, "Algorithm", None)
@@ -1363,7 +1473,7 @@ def patch_sparse_c2s_block(
     chunk_size: int = DEFAULT_VOXEL_CHUNK_SIZE,
 ) -> None:
     """Optimize SparseResBlockC2S3d via vectorized single-nonzero C2S gather, cross-decoder gather cache, and fused skip add."""
-    if getattr(c2s_cls, "_trellis2_vram_patched", False):
+    if _is_already_patched(c2s_cls, "_trellis2_vram_patched"):
         return
     orig_forward = c2s_cls._forward
 
@@ -1691,7 +1801,7 @@ def patch_sparse_unet_decoder(
     chunk_size: int = DEFAULT_VOXEL_CHUNK_SIZE,
 ) -> None:
     """Enable stage streaming (when needed), cross-decoder FlexGEMM/Swin cache reuse, and chunked output head."""
-    if getattr(decoder_cls, "_trellis2_vram_patched", False):
+    if _is_already_patched(decoder_cls, "_trellis2_vram_patched"):
         return
     orig_forward = decoder_cls.forward
     orig_upsample = decoder_cls.upsample
@@ -1934,24 +2044,38 @@ def _chunked_fdg_to_mesh(
     o_voxel_c: Any | None = None,
     edge_chunk: int = 2_000_000,
 ) -> tuple[Any, Any] | None:
-    """Bit-exact chunked Dual-Grid mesh extraction avoiding 2.5+ GiB (N,3,4,3) dense edge expansion."""
+    """Bit-exact chunked Dual-Grid mesh extraction avoiding multi-GiB (N,3,4,3) dense edge expansion."""
     n = int(dual_vertices.shape[0])
     min_vox = int(os.environ.get("TRELLIS2_CHUNKED_FDG_MIN_VOXELS", "2000000"))
-    if split_weight is None or n < min_vox:
+    if n < min_vox:
+        return None
+    if split_weight is None:
+        log.warning("Chunked Dual-Grid extraction skipped (split_weight=None, N=%d)", n)
         return None
     if o_voxel_c is None:
         if not bool(getattr(coords, "is_cuda", False)):
+            log.warning("Chunked Dual-Grid extraction skipped (non-CUDA coords, N=%d)", n)
             return None
-        try:
-            from o_voxel import _C as o_voxel_c  # type: ignore[import-not-found]
-        except Exception:
-            return None
+        for mod_name in ("o_voxel._C", "o_voxel"):
+            try:
+                mod_obj = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+                cand_c = mod_obj if mod_name.endswith("._C") else getattr(mod_obj, "_C", None)
+                if cand_c is not None:
+                    o_voxel_c = cand_c
+                    break
+            except Exception:
+                continue
+        if o_voxel_c is None:
+            fdg_mod = sys.modules.get("o_voxel.convert.flexible_dual_grid")
+            o_voxel_c = getattr(fdg_mod, "_C", None) if fdg_mod is not None else None
     if not (
         callable(getattr(o_voxel_c, "hashmap_insert_3d_idx_as_val_cuda", None))
         and callable(getattr(o_voxel_c, "hashmap_lookup_3d_cuda", None))
     ):
+        log.warning("Chunked Dual-Grid extraction skipped (o_voxel._C hash ops unavailable, N=%d)", n)
         return None
 
+    log.info("Running chunked Dual-Grid mesh extraction (N=%d, grid=%d)", n, int(grid_size))
     dev = coords.device
     gs = [int(grid_size), int(grid_size), int(grid_size)]
     aabb_t = torch_mod.tensor(aabb, dtype=torch_mod.float32, device=dev)
@@ -1970,12 +2094,6 @@ def _chunked_fdg_to_mesh(
     o_voxel_c.hashmap_insert_3d_idx_as_val_cuda(hashmap_keys, hashmap_vals, insert_keys, *gs)
     del insert_keys
 
-    nz = intersected_flag.nonzero()
-    edge_vox = nz[:, 0]
-    edge_ax = nz[:, 1]
-    m_edges = int(nz.shape[0])
-    del nz
-
     edge_offsets = torch_mod.tensor(
         [
             [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
@@ -1986,29 +2104,41 @@ def _chunked_fdg_to_mesh(
         device=dev,
     )
 
+    vox_chunk = max(4_000_000, edge_chunk * 2)
     quad_chunks: list[Any] = []
-    for s in range(0, m_edges, edge_chunk):
-        e = min(s + edge_chunk, m_edges)
-        c_len = e - s
-        c_sub = coords[edge_vox[s:e]].unsqueeze(1) + edge_offsets[edge_ax[s:e]]
-        q_keys = torch_mod.cat(
-            [
-                torch_mod.zeros((c_len * 4, 1), dtype=torch_mod.int32, device=dev),
-                c_sub.reshape(-1, 3).int(),
-            ],
-            dim=1,
-        )
-        del c_sub
-        q_idx = o_voxel_c.hashmap_lookup_3d_cuda(hashmap_keys, hashmap_vals, q_keys, *gs).reshape(
-            c_len, 4
-        ).int()
-        del q_keys
-        valid = (q_idx != 0xFFFFFFFF).all(dim=1)
-        if bool(valid.any()):
-            quad_chunks.append(q_idx[valid].int())
-        del q_idx, valid
+    for vs in range(0, n, vox_chunk):
+        ve = min(vs + vox_chunk, n)
+        nz = intersected_flag[vs:ve].nonzero()
+        m_sub = int(nz.shape[0])
+        if m_sub == 0:
+            del nz
+            continue
+        edge_vox = nz[:, 0] + vs
+        edge_ax = nz[:, 1]
+        del nz
+        for s in range(0, m_sub, edge_chunk):
+            e = min(s + edge_chunk, m_sub)
+            c_len = e - s
+            c_sub = coords[edge_vox[s:e]].unsqueeze(1) + edge_offsets[edge_ax[s:e]]
+            q_keys = torch_mod.cat(
+                [
+                    torch_mod.zeros((c_len * 4, 1), dtype=torch_mod.int32, device=dev),
+                    c_sub.reshape(-1, 3).int(),
+                ],
+                dim=1,
+            )
+            del c_sub
+            q_idx = o_voxel_c.hashmap_lookup_3d_cuda(hashmap_keys, hashmap_vals, q_keys, *gs).reshape(
+                c_len, 4
+            ).int()
+            del q_keys
+            valid = (q_idx != 0xFFFFFFFF).all(dim=1)
+            if bool(valid.any()):
+                quad_chunks.append(q_idx[valid].int())
+            del q_idx, valid
+        del edge_vox, edge_ax
 
-    del hashmap_keys, hashmap_vals, edge_vox, edge_ax, edge_offsets
+    del hashmap_keys, hashmap_vals, edge_offsets
     quad_indices = (
         torch_mod.cat(quad_chunks, dim=0)
         if quad_chunks
@@ -2051,9 +2181,11 @@ def patch_fdg_decoder(
     chunk_size: int = DEFAULT_VOXEL_CHUNK_SIZE,
 ) -> None:
     """Free decoded voxel tensor & caches before running Dual-Grid mesh extraction at 1536^3."""
-    if getattr(fdg_cls, "_trellis2_vram_patched", False):
+    if _is_already_patched(fdg_cls, "_trellis2_fdg_patched"):
         return
     orig_forward = fdg_cls.forward
+    dual_grid_mod = sys.modules.get(getattr(dual_grid_fn, "__module__", ""))
+    dual_grid_c = getattr(dual_grid_mod, "_C", None) if dual_grid_mod is not None else None
 
     def _low_mem_fdg_forward(self: Any, x: Any, gt_intersected: Any = None, **kwargs: Any) -> Any:
         if getattr(self, "training", False):
@@ -2106,6 +2238,7 @@ def patch_fdg_decoder(
                 aabb=aabb_box,
                 grid_size=self.resolution,
                 torch_mod=torch_mod,
+                o_voxel_c=dual_grid_c,
             )
             if extracted is None:
                 extracted = dual_grid_fn(
@@ -2124,7 +2257,7 @@ def patch_fdg_decoder(
         return out_list[0] if len(out_list) == 1 else tuple(out_list)
 
     fdg_cls.forward = _low_mem_fdg_forward
-    fdg_cls._trellis2_vram_patched = True
+    fdg_cls._trellis2_fdg_patched = True
 
 
 def patch_sparse_ffn(
@@ -2134,7 +2267,7 @@ def patch_sparse_ffn(
     chunk_size: int = DEFAULT_TOKEN_CHUNK_SIZE,
 ) -> None:
     """Chunk SparseFeedForwardNet (1536 -> 8192 -> 1536) when VRAM is tight; fuse with Inductor when VRAM is ample."""
-    if getattr(ffn_cls, "_trellis2_vram_patched", False):
+    if _is_already_patched(ffn_cls, "_trellis2_vram_patched"):
         return
     orig_forward = ffn_cls.forward
 
@@ -2319,7 +2452,7 @@ def patch_cross_attention_kv_cache(
     dense_attn_fn: Callable[..., Any] | None = None,
 ) -> None:
     """Cache static DINOv3 cross-attention (K, V) projections in VRAM across all Euler diffusion steps."""
-    if sparse_mha_cls is not None and not getattr(sparse_mha_cls, "_trellis2_kv_cache_patched", False):
+    if sparse_mha_cls is not None and not _is_already_patched(sparse_mha_cls, "_trellis2_kv_cache_patched"):
         orig_sparse_fwd = sparse_mha_cls.forward
 
         def _cached_sparse_mha_forward(self: Any, x: Any, context: Any = None) -> Any:
@@ -2408,7 +2541,7 @@ def patch_cross_attention_kv_cache(
         sparse_mha_cls.forward = _cached_sparse_mha_forward
         sparse_mha_cls._trellis2_kv_cache_patched = True
 
-    if dense_mha_cls is not None and not getattr(dense_mha_cls, "_trellis2_kv_cache_patched", False):
+    if dense_mha_cls is not None and not _is_already_patched(dense_mha_cls, "_trellis2_kv_cache_patched"):
         orig_dense_fwd = dense_mha_cls.forward
 
         def _cached_dense_mha_forward(
@@ -2479,7 +2612,7 @@ def patch_cfg_sampler_batching(
     torch_mod: Any,
 ) -> None:
     """Batch positive+negative Classifier-Free Guidance into one batch=2 pass & manage KV/RoPE caches."""
-    if not getattr(cfg_mixin_cls, "_trellis2_batch_cfg_patched", False):
+    if not _is_already_patched(cfg_mixin_cls, "_trellis2_batch_cfg_patched"):
         orig_cfg_inference = cfg_mixin_cls._inference_model
 
         def _batched_cfg_inference(
@@ -2684,7 +2817,7 @@ def patch_cfg_sampler_batching(
         cfg_mixin_cls._inference_model = _batched_cfg_inference
         cfg_mixin_cls._trellis2_batch_cfg_patched = True
 
-    if flow_euler_cls is not None and not getattr(flow_euler_cls, "_trellis2_fast_euler_patched", False):
+    if flow_euler_cls is not None and not _is_already_patched(flow_euler_cls, "_trellis2_fast_euler_patched"):
         orig_sample = flow_euler_cls.sample
 
         def _fast_euler_sample(
@@ -2813,7 +2946,7 @@ def patch_timestep_embedder_cache(timestep_embedder_cls: Any, torch_mod: Any) ->
 
 def patch_sparse_structure_cudagraph(ss_flow_cls: Any, torch_mod: Any) -> None:
     """Capture static-shape 30-block SparseStructureFlowModel into CUDA Graphs (~960 kernels -> 1 replay)."""
-    if ss_flow_cls is None or getattr(ss_flow_cls, "_trellis2_cudagraph_patched", False):
+    if ss_flow_cls is None or _is_already_patched(ss_flow_cls, "_trellis2_cudagraph_patched"):
         return
     orig_forward = ss_flow_cls.forward
 
@@ -2903,7 +3036,7 @@ def patch_sparse_structure_cudagraph(ss_flow_cls: Any, torch_mod: Any) -> None:
 
 def patch_mesh_simplify_noop(mesh_cls: Any) -> None:
     """Skip redundant CuMesh 12M-triangle build+readback when face count is already <= target (e.g. 16,777,216)."""
-    if mesh_cls is None or getattr(mesh_cls, "_trellis2_simplify_patched", False):
+    if mesh_cls is None or _is_already_patched(mesh_cls, "_trellis2_simplify_patched"):
         return
     orig_simplify = mesh_cls.simplify
 
@@ -4067,6 +4200,7 @@ def _persist_flex_gemm_autotune_cache() -> None:
     if fg is None:
         return
     for attr_chain in (
+        ("utils", "autotuner", "save_autotune_cache"),
         ("autotuner", "save_cache"),
         ("autotune", "save_cache"),
         ("ops", "autotuner", "save_cache"),
@@ -4389,7 +4523,7 @@ class VRAMModelManager:
 
 def patch_dit_block_streaming(slat_flow_cls: Any) -> None:
     """Optional Active-Parameter Block Streaming for 1.3B DiT SLatFlowModel (1 block on GPU at a time)."""
-    if getattr(slat_flow_cls, "_trellis2_dit_stream_patched", False):
+    if _is_already_patched(slat_flow_cls, "_trellis2_dit_stream_patched"):
         return
     orig_to = slat_flow_cls.to
     orig_forward = slat_flow_cls.forward
@@ -4526,6 +4660,7 @@ def install_trellis2_vram_optimizations(
     if "TRELLIS2_HASHMAP_RATIO" in os.environ:
         conv_config.FLEX_GEMM_HASHMAP_RATIO = float(os.environ["TRELLIS2_HASHMAP_RATIO"])
 
+    patch_flex_gemm_autotune_cache_safety()
     patch_layernorm32(LayerNorm32, torch_mod, DEFAULT_VOXEL_CHUNK_SIZE)
     try:
         import flex_gemm.ops.spconv.submanifold_conv3d as flex_subm_mod  # type: ignore[import-not-found]
