@@ -4828,13 +4828,18 @@ class JobManager:
     def _read_status(self, job_id: str) -> JobRecord | None:
         if not _JOB_ID_RE.match(job_id):
             return None
+        if not self._jobs_dir.is_dir():
+            return None
         try:
-            jobs_root = self._jobs_dir.resolve()
-            job_dir = (jobs_root / job_id).resolve()
-            if job_dir.parent != jobs_root:
+            job_dir: Path | None = None
+            for entry in self._jobs_dir.iterdir():
+                if entry.name == job_id and entry.is_dir():
+                    job_dir = entry
+                    break
+            if job_dir is None:
                 return None
-            status_file = (job_dir / "status.json").resolve()
-            if status_file.parent != job_dir or not status_file.is_file():
+            status_file = job_dir / "status.json"
+            if not status_file.is_file():
                 return None
             data = json.loads(status_file.read_text(encoding="utf-8"))
             return JobRecord(
