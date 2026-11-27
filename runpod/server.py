@@ -3081,16 +3081,19 @@ def _compact_mesh_vertices(
     faces: Any,
     torch_mod: Any,
     face_chunk: int = 4_000_000,
-) -> tuple[Any, Any]:
+    return_keep_idx: bool = False,
+) -> tuple[Any, ...]:
     """Strip unreferenced dual-grid vertices before CuMesh to shrink vertex/boundary buffers ~5-7x."""
     if vertices is None or faces is None or torch_mod is None:
-        return vertices, faces
+        return (vertices, faces, None) if return_keep_idx else (vertices, faces)
     try:
         v_count = int(vertices.shape[0])
         f_count = int(faces.shape[0])
     except Exception:
-        return vertices, faces
+        return (vertices, faces, None) if return_keep_idx else (vertices, faces)
     if v_count <= 0 or f_count <= 0:
+        if return_keep_idx:
+            return vertices, faces, torch_mod.arange(v_count, dtype=torch_mod.long, device=vertices.device)
         return vertices, faces
 
     dev = vertices.device
@@ -3106,13 +3109,16 @@ def _compact_mesh_vertices(
     del used
     new_v_count = int(keep_idx.shape[0])
     if new_v_count >= v_count:
+        if return_keep_idx:
+            return vertices, faces, keep_idx
         del keep_idx
         return vertices, faces
 
     remap = torch_mod.empty((v_count,), dtype=faces.dtype, device=dev)
     remap[keep_idx] = torch_mod.arange(new_v_count, dtype=faces.dtype, device=dev)
     new_vertices = vertices[keep_idx].contiguous()
-    del keep_idx
+    if not return_keep_idx:
+        del keep_idx
     new_faces = torch_mod.empty_like(faces, device=dev)
     for s in range(0, f_count, face_chunk):
         e = min(s + face_chunk, f_count)
@@ -3121,7 +3127,534 @@ def _compact_mesh_vertices(
             f_slice = f_slice.to(dev)
         new_faces[s:e].copy_(remap[f_slice.long()])
     del remap
+    if return_keep_idx:
+        return new_vertices, new_faces, keep_idx
     return new_vertices, new_faces
+
+
+def _run_cumesh_simplify_once(
+    v_dev: Any,
+    f_dev: Any,
+    target: int,
+    torch_mod: Any,
+    cumesh_mod: Any,
+    verbose: bool = False,
+    opts: dict[str, Any] | None = None,
+    compact_out: bool = True,
+) -> tuple[Any, Any]:
+    """Run a single CuMesh simplify pass after dropping caller input buffers on GPU."""
+    use_cuda = bool(getattr(v_dev, "is_cuda", False) and torch_mod.cuda.is_available())
+    cm = cumesh_mod.CuMesh()
+    try:
+        cm.init(v_dev, f_dev)
+        del v_dev, f_dev
+        if use_cuda:
+            gc.collect()
+            torch_mod.cuda.empty_cache()
+        cm.simplify(target, verbose=verbose, options=opts or {})
+        out_v, out_f = cm.read()
+        del cm
+        cm = None
+        if use_cuda:
+            gc.collect()
+            torch_mod.cuda.empty_cache()
+        if compact_out:
+            out_v, out_f = _compact_mesh_vertices(out_v, out_f, torch_mod)
+        return out_v, out_f
+    except Exception as exc:
+        if exc.__traceback__ is not None:
+            traceback.clear_frames(exc.__traceback__)
+        cm = None
+        if use_cuda or _is_oom_like(exc):
+            _clear_sticky_cuda_error(torch_mod)
+        if use_cuda:
+            gc.collect()
+            torch_mod.cuda.empty_cache()
+        raise
+
+
+def _choose_min_seam_split_axis(
+    v_work: Any,
+    f_work: Any,
+    num_slabs: int,
+    torch_mod: Any,
+    phase_shift: float = 0.0,
+) -> tuple[int, Any]:
+    """Select the spatial axis with the smallest cross-slab seam perimeter for quantile binning."""
+    dev = v_work.device
+    v_count = int(v_work.shape[0])
+    f_count = int(f_work.shape[0])
+    v_stride = max(1, v_count // 500_000)
+    f_stride = max(1, f_count // 500_000)
+    f_sample = f_work[::f_stride].long()
+
+    # Quantile interior cut positions (shifted optionally on recursive retry to move cut lines off old seams)
+    if phase_shift > 0.0:
+        qs = torch_mod.linspace(0.0, 1.0, num_slabs + 1, dtype=torch_mod.float32, device=dev)[1:-1]
+        step_q = 1.0 / float(num_slabs)
+        qs = torch_mod.clamp(qs + (phase_shift * step_q), 0.02, 0.98)
+    else:
+        qs = torch_mod.linspace(0.0, 1.0, num_slabs + 1, dtype=torch_mod.float32, device=dev)[1:-1]
+
+    span = v_work.max(dim=0).values - v_work.min(dim=0).values
+    max_span = max(float(span.max().item()), 1e-8)
+
+    best_axis = int(span.argmax().item())
+    best_cuts = None
+    best_seam = None
+    for ax in range(3):
+        v_ax_c = v_work[:, ax].contiguous()
+        cuts_ax = torch_mod.quantile(v_ax_c[::v_stride].float(), qs).to(v_ax_c.dtype)
+        # Skip severely squashed axes relative to longest span unless nothing better
+        if float(span[ax].item()) < 0.25 * max_span and best_cuts is not None:
+            continue
+        vb_ax = torch_mod.bucketize(v_ax_c, cuts_ax)
+        fb0 = vb_ax[f_sample[:, 0]]
+        fb1 = vb_ax[f_sample[:, 1]]
+        fb2 = vb_ax[f_sample[:, 2]]
+        seam_est = int((~((fb0 == fb1) & (fb1 == fb2))).sum().item())
+        if best_seam is None or seam_est < best_seam:
+            best_seam = seam_est
+            best_axis = ax
+            best_cuts = cuts_ax
+        del v_ax_c, vb_ax, fb0, fb1, fb2
+
+    assert best_cuts is not None
+    return best_axis, best_cuts
+
+
+def _eval_qem_points(eq: Any, pt: Any) -> Any:
+    """Evaluate packed symmetric 4x4 QEM error v^T Q v (clamped >= 0) for edge endpoints."""
+    x, y, z = pt[:, 0], pt[:, 1], pt[:, 2]
+    return (
+        eq[:, 0] * x * x
+        + 2.0 * eq[:, 1] * x * y
+        + 2.0 * eq[:, 2] * x * z
+        + eq[:, 3] * y * y
+        + 2.0 * eq[:, 4] * y * z
+        + eq[:, 5] * z * z
+        + 2.0 * eq[:, 6] * x
+        + 2.0 * eq[:, 7] * y
+        + 2.0 * eq[:, 8] * z
+        + eq[:, 9]
+    ).clamp_min(0.0)
+
+
+def _qem_coarsen_slab_locked(
+    v_sub: Any,
+    f_sub: Any,
+    is_locked: Any,
+    target_faces: int,
+    torch_mod: Any,
+    lambda_el: float = 1e-3,
+    max_iters: int = 24,
+) -> tuple[Any, Any]:
+    """Vectorized GPU/CPU QEM edge-collapse that keeps locked/seam/boundary vertices fixed in place."""
+    dev = v_sub.device
+    v_cnt = int(v_sub.shape[0])
+    f_cur = int(f_sub.shape[0])
+    if f_cur <= target_faces or v_cnt <= 3:
+        return v_sub, f_sub
+
+    f = f_sub.to(torch_mod.int32).clone() if f_sub.dtype != torch_mod.int32 else f_sub.clone()
+    p_min = v_sub.min(dim=0).values
+    p_max = v_sub.max(dim=0).values
+    center = 0.5 * (p_min + p_max)
+    inv_scale = 2.0 / max(float((p_max - p_min).max().item()), 1e-8)
+    p = (v_sub - center) * inv_scale
+
+    # Chunked initial per-vertex quadrics (keeps peak VRAM small even on 40M+ face slabs)
+    qem = torch_mod.zeros((v_cnt, 10), dtype=torch_mod.float32, device=dev)
+    face_chunk = 4_000_000
+    for s in range(0, f_cur, face_chunk):
+        e = min(s + face_chunk, f_cur)
+        fc = f[s:e].long()
+        p0, p1, p2 = p[fc[:, 0]], p[fc[:, 1]], p[fc[:, 2]]
+        n = torch_mod.cross(p1 - p0, p2 - p0, dim=-1)
+        nl = n.norm(dim=-1, keepdim=True)
+        n = torch_mod.where(nl > 1e-12, n / nl.clamp_min(1e-12), torch_mod.zeros_like(n))
+        d = -(n * p0).sum(dim=-1)
+        nx, ny, nz = n[:, 0], n[:, 1], n[:, 2]
+        fq = torch_mod.stack(
+            [nx * nx, nx * ny, nx * nz, ny * ny, ny * nz, nz * nz, nx * d, ny * d, nz * d, d * d],
+            dim=-1,
+        )
+        for col in range(3):
+            qem.index_add_(0, fc[:, col], fq)
+        del fc, p0, p1, p2, n, nl, d, nx, ny, nz, fq
+
+    sentinel = 1 << 62
+    edge_chunk = 4_000_000
+
+    for _it in range(max_iters):
+        f_cur = int(f.shape[0])
+        if f_cur <= target_faces:
+            break
+
+        # Build undirected edge keys in one pre-allocated int64 buffer (avoids (3F,2) intermediate)
+        e_pack = torch_mod.empty((3 * f_cur,), dtype=torch_mod.int64, device=dev)
+        for ei, (ia, ib) in enumerate(((0, 1), (1, 2), (2, 0))):
+            off = ei * f_cur
+            for s in range(0, f_cur, face_chunk):
+                e = min(s + face_chunk, f_cur)
+                va = f[s:e, ia].long()
+                vb = f[s:e, ib].long()
+                lo = torch_mod.minimum(va, vb)
+                hi = torch_mod.maximum(va, vb)
+                e_pack[off + s : off + e] = (lo << 32) | hi
+        u_edges, e_cnts = torch_mod.unique(e_pack, return_counts=True)
+        del e_pack
+
+        e0 = u_edges >> 32
+        e1 = u_edges & 0xFFFFFFFF
+        del u_edges
+
+        # Protect seam vertices, natural open boundaries, and non-manifold vertices from any collapse
+        prot_nm = is_locked.clone()
+        nm_e = e_cnts > 2
+        if bool(nm_e.any()):
+            prot_nm[e0[nm_e]] = True
+            prot_nm[e1[nm_e]] = True
+
+        prot = prot_nm.clone()
+        bnd_e = e_cnts == 1
+        if bool(bnd_e.any()):
+            prot[e0[bnd_e]] = True
+            prot[e1[bnd_e]] = True
+        del e_cnts, bnd_e, nm_e
+
+        free_mask = (~prot[e0]) & (~prot[e1])
+        if not bool(free_mask.any()):
+            # Fallback for thin open ribbons (e.g. single-strip hair tips) where every edge touches a natural boundary;
+            # seam vertices (`is_locked`) and non-manifold vertices (`prot_nm`) remain strictly immovable.
+            free_mask = (~prot_nm[e0]) & (~prot_nm[e1])
+        del prot, prot_nm
+        c0 = e0[free_mask]
+        c1 = e1[free_mask]
+        del e0, e1, free_mask
+
+        m = int(c0.shape[0])
+        if m == 0:
+            break
+
+        # Chunked edge QEM evaluation -> stores only float32 cost + uint8 endpoint choice (0=mid, 1=v0, 2=v1)
+        costs = torch_mod.empty((m,), dtype=torch_mod.float32, device=dev)
+        choices = torch_mod.empty((m,), dtype=torch_mod.uint8, device=dev)
+        for s in range(0, m, edge_chunk):
+            e = min(s + edge_chunk, m)
+            s0, s1 = c0[s:e], c1[s:e]
+            p0_c, p1_c = p[s0], p[s1]
+            pm_c = 0.5 * (p0_c + p1_c)
+            eq_c = qem[s0] + qem[s1]
+            qm_c = _eval_qem_points(eq_c, pm_c)
+            q0_c = _eval_qem_points(eq_c, p0_c)
+            q1_c = _eval_qem_points(eq_c, p1_c)
+            best_q, best_ch = torch_mod.stack([qm_c, q0_c, q1_c], dim=-1).min(dim=-1)
+            l2_c = ((p1_c - p0_c) ** 2).sum(dim=-1)
+            costs[s:e] = best_q + lambda_el * l2_c
+            choices[s:e] = best_ch.to(torch_mod.uint8)
+            del s0, s1, p0_c, p1_c, pm_c, eq_c, qm_c, q0_c, q1_c, best_q, best_ch, l2_c
+
+        remove_need = f_cur - target_faces
+        frac = min(1.0, max(0.20, (remove_need / max(1, 2 * m)) * 5.0))
+        if frac < 0.99 and m > 256:
+            # Sample <=500k elements before torch.quantile (PyTorch limits quantile() to <= 2^24 elements)
+            c_samp = costs[:: max(1, m // 500_000)].float()
+            cutoff = torch_mod.quantile(c_samp, frac)
+            sel = costs <= cutoff
+            c0, c1, choices, costs = c0[sel], c1[sel], choices[sel], costs[sel]
+            del c_samp, cutoff, sel
+            m = int(c0.shape[0])
+            if m == 0:
+                del costs, choices
+                break
+
+        # Quantize QEM cost into 16 log-scale tiers (bits 58..61) + 31-bit avalanche hash + 27-bit edge id
+        log_c = torch_mod.log10(costs.float().clamp_min(1e-12))
+        log_lo = float(log_c.min().item())
+        log_hi = max(log_lo + 0.5, float(log_c.max().item()))
+        tier = torch_mod.clamp(((log_c - log_lo) / (log_hi - log_lo) * 15.99).to(torch_mod.int64), 0, 15)
+        z = ((c0 + 1) * 2654435761) ^ ((c1 + 1) * 2246822519) ^ ((_it + 1) * 3266489917)
+        z = (z ^ (z >> 16)) * 3266489917
+        z = (z ^ (z >> 15)) * 2654435761
+        h = (z ^ (z >> 17)) & ((1 << 31) - 1)
+        eid_low = torch_mod.arange(m, dtype=torch_mod.int64, device=dev) & ((1 << 27) - 1)
+        keys = (tier << 58) | (h << 27) | eid_low
+        del costs, log_c, tier, z, h, eid_low
+
+        # Strictly 2-hop / 1-ring disjoint independent set (no two winners touch the same face)
+        v_best = torch_mod.full((v_cnt,), sentinel, dtype=torch_mod.int64, device=dev)
+        v_best.scatter_reduce_(0, c0, keys, reduce="amin", include_self=True)
+        v_best.scatter_reduce_(0, c1, keys, reduce="amin", include_self=True)
+
+        v_win = torch_mod.full((v_cnt,), sentinel, dtype=torch_mod.int64, device=dev)
+        for s in range(0, f_cur, face_chunk):
+            e = min(s + face_chunk, f_cur)
+            fc = f[s:e].long()
+            fb_c = torch_mod.minimum(
+                torch_mod.minimum(v_best[fc[:, 0]], v_best[fc[:, 1]]), v_best[fc[:, 2]]
+            )
+            for col in range(3):
+                v_win.scatter_reduce_(0, fc[:, col], fb_c, reduce="amin", include_self=True)
+            del fc, fb_c
+        del v_best
+
+        win_mask = (v_win[c0] == keys) & (v_win[c1] == keys)
+        del v_win, keys
+        wc0 = c0[win_mask]
+        wc1 = c1[win_mask]
+        wch = choices[win_mask]
+        del c0, c1, choices, win_mask
+
+        w_cnt = int(wc0.shape[0])
+        if w_cnt == 0:
+            break
+
+        max_collapses = max(1, (f_cur - target_faces + 1) // 2)
+        if w_cnt > max_collapses:
+            wc0 = wc0[:max_collapses]
+            wc1 = wc1[:max_collapses]
+            wch = wch[:max_collapses]
+            w_cnt = max_collapses
+
+        p0_w, p1_w = p[wc0], p[wc1]
+        pm_w = 0.5 * (p0_w + p1_w)
+        w_p = torch_mod.where(
+            (wch == 1).unsqueeze(-1),
+            p0_w,
+            torch_mod.where((wch == 2).unsqueeze(-1), p1_w, pm_w),
+        )
+        del p0_w, p1_w, pm_w, wch
+
+        # Tentative collapse validation: reject normal flips, zero-area slivers, and non-manifold pinches
+        v_to = torch_mod.arange(v_cnt, dtype=torch_mod.int32, device=dev)
+        v_to[wc1] = wc0.to(torch_mod.int32)
+        p_tent = p.clone()
+        p_tent[wc0] = w_p
+
+        w_tag = torch_mod.full((v_cnt,), -1, dtype=torch_mod.int32, device=dev)
+        w_ids = torch_mod.arange(w_cnt, dtype=torch_mod.int32, device=dev)
+        w_tag[wc0] = w_ids
+        w_tag[wc1] = w_ids
+        del w_ids
+
+        orig_chunks: list[Any] = []
+        new_chunks: list[Any] = []
+        tag_chunks: list[Any] = []
+        for s in range(0, f_cur, face_chunk):
+            e = min(s + face_chunk, f_cur)
+            f_sub_c = f[s:e].long()
+            ft_c = torch_mod.maximum(
+                torch_mod.maximum(w_tag[f_sub_c[:, 0]], w_tag[f_sub_c[:, 1]]), w_tag[f_sub_c[:, 2]]
+            )
+            chg = ft_c >= 0
+            if bool(chg.any()):
+                fo_c = f_sub_c[chg]
+                fn_c = v_to[fo_c].long()
+                ftg_c = ft_c[chg]
+                sv_c = (fn_c[:, 0] != fn_c[:, 1]) & (fn_c[:, 1] != fn_c[:, 2]) & (fn_c[:, 0] != fn_c[:, 2])
+                if bool(sv_c.any()):
+                    orig_chunks.append(fo_c[sv_c])
+                    new_chunks.append(fn_c[sv_c])
+                    tag_chunks.append(ftg_c[sv_c])
+        del w_tag, v_to
+
+        win_ok = torch_mod.ones((w_cnt,), dtype=torch_mod.bool, device=dev)
+        if orig_chunks:
+            f_s_orig = torch_mod.cat(orig_chunks, dim=0)
+            f_s_new = torch_mod.cat(new_chunks, dim=0)
+            f_s_tag = torch_mod.cat(tag_chunks, dim=0)
+            del orig_chunks, new_chunks, tag_chunks
+
+            old_n = torch_mod.cross(
+                p[f_s_orig[:, 1]] - p[f_s_orig[:, 0]],
+                p[f_s_orig[:, 2]] - p[f_s_orig[:, 0]],
+                dim=-1,
+            )
+            new_n = torch_mod.cross(
+                p_tent[f_s_new[:, 1]] - p_tent[f_s_new[:, 0]],
+                p_tent[f_s_new[:, 2]] - p_tent[f_s_new[:, 0]],
+                dim=-1,
+            )
+            on_l = old_n.norm(dim=-1)
+            nn_l = new_n.norm(dim=-1)
+            bad_flip = ((old_n * new_n).sum(dim=-1) <= 1e-6 * on_l * nn_l) | (nn_l <= 1e-12)
+            if bool(bad_flip.any()):
+                win_ok[f_s_tag[bad_flip].long()] = False
+            del old_n, new_n, on_l, nn_l, bad_flip, f_s_orig
+
+            is_keep_col = f_s_new == wc0[f_s_tag.long()].unsqueeze(-1)
+            others = f_s_new[~is_keep_col].reshape(-1, 2)
+            del is_keep_col, f_s_new
+            e_ku = torch_mod.cat(
+                [
+                    torch_mod.stack([f_s_tag.long(), others[:, 0]], dim=-1),
+                    torch_mod.stack([f_s_tag.long(), others[:, 1]], dim=-1),
+                ],
+                dim=0,
+            )
+            u_ku, ku_cnts = torch_mod.unique((e_ku[:, 0] << 32) | e_ku[:, 1], return_counts=True)
+            del e_ku
+            bad_nm = ku_cnts > 2
+            if bool(bad_nm.any()):
+                win_ok[u_ku[bad_nm] >> 32] = False
+            del u_ku, ku_cnts, bad_nm
+
+            olo = torch_mod.minimum(others[:, 0], others[:, 1])
+            ohi = torch_mod.maximum(others[:, 0], others[:, 1])
+            dup_key = torch_mod.stack([f_s_tag.long(), olo, ohi], dim=-1)
+            u_dk, u_dc = torch_mod.unique(dup_key, dim=0, return_counts=True)
+            bad_dup = u_dc > 1
+            if bool(bad_dup.any()):
+                win_ok[u_dk[bad_dup][:, 0]] = False
+            del others, olo, ohi, dup_key, u_dk, u_dc, bad_dup, f_s_tag
+        else:
+            del orig_chunks, new_chunks, tag_chunks
+
+        del p_tent
+        wc0 = wc0[win_ok]
+        wc1 = wc1[win_ok]
+        w_p = w_p[win_ok]
+        del win_ok
+        if int(wc0.shape[0]) == 0:
+            break
+
+        # Commit verified collapses
+        v_to = torch_mod.arange(v_cnt, dtype=torch_mod.int32, device=dev)
+        v_to[wc1] = wc0.to(torch_mod.int32)
+        p[wc0] = w_p
+        qem[wc0] += qem[wc1]
+        del wc0, wc1, w_p
+
+        surv_list: list[Any] = []
+        for s in range(0, f_cur, face_chunk):
+            e = min(s + face_chunk, f_cur)
+            fn_c = v_to[f[s:e].long()]
+            keep_c = (fn_c[:, 0] != fn_c[:, 1]) & (fn_c[:, 1] != fn_c[:, 2]) & (fn_c[:, 0] != fn_c[:, 2])
+            if bool(keep_c.any()):
+                surv_list.append(fn_c[keep_c])
+        del v_to
+        f = torch_mod.cat(surv_list, dim=0) if surv_list else torch_mod.empty((0, 3), dtype=torch_mod.int32, device=dev)
+        del surv_list
+
+    del qem
+    v_out = (p / inv_scale) + center
+    return v_out.to(v_sub.dtype), f
+
+
+def _weld_and_coarsen_slabs(
+    v_work: Any,
+    f_work: Any,
+    mid_target: int,
+    num_slabs: int,
+    torch_mod: Any,
+    use_cuda: bool,
+    phase_shift: float = 0.0,
+) -> tuple[Any, Any]:
+    """Partition mesh cleanly along min-seam axis, lock & weld seam vertices globally, and QEM-coarsen slab interiors."""
+    dev = v_work.device
+    v_cnt = int(v_work.shape[0])
+    f_cnt = int(f_work.shape[0])
+    axis, cuts = _choose_min_seam_split_axis(v_work, f_work, num_slabs, torch_mod, phase_shift=phase_shift)
+    v_ax = v_work[:, axis].contiguous()
+    v_bin = torch_mod.bucketize(v_ax, cuts).to(torch_mod.int8)
+    del v_ax, cuts
+
+    f_slab = torch_mod.empty((f_cnt,), dtype=torch_mod.int8, device=dev)
+    seam_verts_mask = torch_mod.zeros((v_cnt,), dtype=torch_mod.bool, device=dev)
+    chunk_sz = 8_000_000
+    for s in range(0, f_cnt, chunk_sz):
+        e = min(s + chunk_sz, f_cnt)
+        f_sub = f_work[s:e].long()
+        b0 = v_bin[f_sub[:, 0]]
+        b1 = v_bin[f_sub[:, 1]]
+        b2 = v_bin[f_sub[:, 2]]
+        same = (b0 == b1) & (b1 == b2)
+        f_slab[s:e] = torch_mod.where(same, b0, torch_mod.tensor(-1, dtype=torch_mod.int8, device=dev))
+        if not bool(same.all()):
+            seam_verts_mask[f_sub[~same].reshape(-1)] = True
+        del f_sub, b0, b1, b2, same
+    del v_bin
+
+    seam_faces = f_work[f_slab < 0]
+    seam_count = int(seam_faces.shape[0])
+    int_total = max(1, f_cnt - seam_count)
+    int_mid_budget = max(1, mid_target - seam_count)
+
+    global_to_merged = torch_mod.full((v_cnt,), -1, dtype=torch_mod.int32, device=dev)
+    seam_gvids = torch_mod.nonzero(seam_verts_mask, as_tuple=False).reshape(-1)
+    n_seam_v = int(seam_gvids.shape[0])
+
+    merged_verts: list[Any] = []
+    merged_faces: list[Any] = []
+    next_v_off = 0
+    if n_seam_v > 0:
+        global_to_merged[seam_gvids] = torch_mod.arange(n_seam_v, dtype=torch_mod.int32, device=dev)
+        sv = v_work[seam_gvids]
+        merged_verts.append(sv.cpu() if use_cuda else sv)
+        del sv
+        next_v_off = n_seam_v
+    del seam_gvids
+
+    if seam_count > 0:
+        sf_merged = torch_mod.empty((seam_count, 3), dtype=torch_mod.int32, device=dev)
+        for s in range(0, seam_count, chunk_sz):
+            e = min(s + chunk_sz, seam_count)
+            sf_merged[s:e].copy_(global_to_merged[seam_faces[s:e].long()])
+        merged_faces.append(sf_merged.cpu() if use_cuda else sf_merged)
+        del sf_merged
+    del seam_faces
+
+    for k in range(num_slabs):
+        slab_faces = f_work[f_slab == k]
+        k_cnt = int(slab_faces.shape[0])
+        if k_cnt == 0:
+            del slab_faces
+            continue
+        k_target = max(1, int(round(int_mid_budget * (k_cnt / int_total))))
+        vk, fk, keep_gids = _compact_mesh_vertices(v_work, slab_faces, torch_mod, return_keep_idx=True)
+        del slab_faces
+        assert keep_gids is not None
+        lk = seam_verts_mask[keep_gids]
+        vk_out, fk_out = _qem_coarsen_slab_locked(vk, fk, lk, min(k_target, k_cnt), torch_mod)
+        del vk, fk
+
+        used_mask = torch_mod.zeros((int(vk_out.shape[0]),), dtype=torch_mod.bool, device=dev)
+        fk_out_cnt = int(fk_out.shape[0])
+        for s in range(0, fk_out_cnt, chunk_sz):
+            e = min(s + chunk_sz, fk_out_cnt)
+            used_mask[fk_out[s:e].reshape(-1).long()] = True
+
+        new_int_mask = used_mask & (~lk)
+        loc_to_merged = torch_mod.full((int(vk_out.shape[0]),), -1, dtype=torch_mod.int32, device=dev)
+        if bool(lk.any()):
+            loc_to_merged[lk] = global_to_merged[keep_gids[lk]]
+        n_new = int(new_int_mask.sum().item())
+        if n_new > 0:
+            loc_to_merged[new_int_mask] = torch_mod.arange(
+                next_v_off, next_v_off + n_new, dtype=torch_mod.int32, device=dev
+            )
+            v_new_part = vk_out[new_int_mask]
+            merged_verts.append(v_new_part.cpu() if use_cuda else v_new_part)
+            del v_new_part
+            next_v_off += n_new
+        del used_mask, new_int_mask, lk, keep_gids, vk_out
+
+        fk_merged = torch_mod.empty((fk_out_cnt, 3), dtype=torch_mod.int32, device=dev)
+        for s in range(0, fk_out_cnt, chunk_sz):
+            e = min(s + chunk_sz, fk_out_cnt)
+            fk_merged[s:e].copy_(loc_to_merged[fk_out[s:e].long()])
+        merged_faces.append(fk_merged.cpu() if use_cuda else fk_merged)
+        del loc_to_merged, fk_out, fk_merged
+
+    del v_work, f_work, f_slab, seam_verts_mask, global_to_merged
+    if use_cuda:
+        gc.collect()
+        torch_mod.cuda.empty_cache()
+
+    all_v = torch_mod.cat(merged_verts, dim=0) if merged_verts else torch_mod.empty((0, 3), dtype=torch_mod.float32)
+    all_f = torch_mod.cat(merged_faces, dim=0) if merged_faces else torch_mod.empty((0, 3), dtype=torch_mod.int32)
+    return all_v, all_f
 
 
 def _simplify_mesh_oom_safe(
@@ -3132,7 +3665,7 @@ def _simplify_mesh_oom_safe(
     verbose: bool = False,
     options: dict[str, Any] | None = None,
 ) -> None:
-    """Simplify Mesh via CuMesh without duplicating VRAM, with seam-protected slab fallback on OOM."""
+    """Simplify Mesh via CuMesh using welded seam-locked Stage-1 QEM + global Stage-2 CuMesh without OOM."""
     verts = mesh_obj.vertices
     faces = mesh_obj.faces
     if verts is None or faces is None:
@@ -3146,175 +3679,118 @@ def _simplify_mesh_oom_safe(
     orig_dev = verts.device
     work_dev = torch_mod.device("cuda") if use_cuda else orig_dev
 
-    # Keep CPU copy on CPU inputs (zero-copy) or oversized GPU meshes so OOM can recover into slabs.
-    keep_backup = bool(orig_dev.type != "cuda" or f_count > 16_777_216)
-    v_cpu = verts.cpu() if keep_backup else None
-    f_cpu = faces.cpu() if keep_backup else None
+    # CuMesh.simplify allocates ~185 bytes/face across edges, CUB sort temp, vert2face, and QEMs.
+    # Proactively bypass doomed single-shot simplify calls when F exceeds ~85% of free VRAM.
+    single_shot_cap: int | None = None
+    if use_cuda and hasattr(torch_mod.cuda, "mem_get_info"):
+        try:
+            free_bytes, _ = torch_mod.cuda.mem_get_info(0)
+            single_shot_cap = max(25_000_000, int((free_bytes * 0.85) // 185))
+        except Exception:
+            single_shot_cap = 105_000_000
+    env_cap = os.environ.get("TRELLIS2_SINGLE_SHOT_SIMPLIFY_MAX_FACES", "").strip()
+    if env_cap:
+        single_shot_cap = int(env_cap)
 
-    v_gpu = verts.to(work_dev).float().contiguous() if verts.device != work_dev else verts.float().contiguous()
-    f_gpu = faces.to(work_dev).int().contiguous() if faces.device != work_dev else faces.int().contiguous()
-    # Release Mesh references BEFORE CuMesh.simplify() so vertices+faces aren't held twice on GPU (~2.7 GiB saved)
+    skip_single_shot = bool(single_shot_cap is not None and f_count > single_shot_cap)
+
+    v_work = verts.to(work_dev).float().contiguous() if verts.device != work_dev else verts.float().contiguous()
+    f_work = faces.to(work_dev).int().contiguous() if faces.device != work_dev else faces.int().contiguous()
+    # Release Mesh references so vertices+faces aren't held twice during simplify (~2.7 GiB saved)
     mesh_obj.vertices = None
     mesh_obj.faces = None
     del verts, faces
-    gc.collect()
     if use_cuda:
+        gc.collect()
         torch_mod.cuda.empty_cache()
 
-    cm = cumesh_mod.CuMesh()
-    try:
-        cm.init(v_gpu, f_gpu)
-        del v_gpu, f_gpu
-        v_gpu = None
-        f_gpu = None
-        gc.collect()
-        if use_cuda:
-            torch_mod.cuda.empty_cache()
-        cm.simplify(target, verbose=verbose, options=opts)
-        out_v, out_f = cm.read()
-        del cm
-        cm = None
-        gc.collect()
-        if use_cuda:
-            torch_mod.cuda.empty_cache()
-        out_v, out_f = _compact_mesh_vertices(out_v, out_f, torch_mod)
-        mesh_obj.vertices = out_v.to(orig_dev) if out_v.device != orig_dev else out_v
-        mesh_obj.faces = out_f.to(orig_dev) if out_f.device != orig_dev else out_f
-        return
-    except Exception as exc:
-        if v_cpu is None and "v_gpu" in locals() and v_gpu is not None:
-            try:
-                v_cpu = v_gpu.cpu()
-                f_cpu = f_gpu.cpu()
-            except Exception:
-                pass
-        if exc.__traceback__ is not None:
-            traceback.clear_frames(exc.__traceback__)
-        cm = None
-        v_gpu = None
-        f_gpu = None
-        _clear_sticky_cuda_error(torch_mod)
-        gc.collect()
-        if use_cuda:
-            torch_mod.cuda.empty_cache()
-        if not _is_oom_like(exc) or v_cpu is None or f_cpu is None:
-            raise
-        log.warning(
-            "Single-shot CuMesh.simplify(%d) hit VRAM limit at %d faces; switching to seam-protected spatial slabs (%s)",
-            target,
+    if not skip_single_shot:
+        # Keep lightweight CPU backup for oversized meshes (>16.77M) in case single-shot still OOMs
+        keep_backup = bool(orig_dev.type != "cuda" or f_count > 16_777_216)
+        v_bak = v_work.cpu() if keep_backup else None
+        f_bak = f_work.cpu() if keep_backup else None
+        try:
+            out_v, out_f = _run_cumesh_simplify_once(
+                v_work, f_work, target, torch_mod, cumesh_mod, verbose=verbose, opts=opts
+            )
+            del v_bak, f_bak
+            mesh_obj.vertices = out_v.to(orig_dev) if out_v.device != orig_dev else out_v
+            mesh_obj.faces = out_f.to(orig_dev) if out_f.device != orig_dev else out_f
+            return
+        except Exception as exc:
+            if not _is_oom_like(exc) or v_bak is None or f_bak is None:
+                raise
+            log.warning(
+                "Single-shot CuMesh.simplify(%d) hit VRAM limit at %d faces; switching to seam-locked 2-stage simplify (%s)",
+                target,
+                f_count,
+                " ".join(s.strip() for s in str(exc).splitlines() if s.strip())[:160],
+            )
+            v_work = v_bak.to(work_dev).contiguous()
+            f_work = f_bak.to(work_dev).contiguous()
+            del v_bak, f_bak
+            eff_cap = max(target, int(f_count * 0.72))
+    else:
+        eff_cap = int(single_shot_cap)  # type: ignore[arg-type]
+        log.info(
+            "Using seam-locked 2-stage GPU simplify for %d -> %d faces (single-shot cap=%d)",
             f_count,
-            " ".join(s.strip() for s in str(exc).splitlines() if s.strip())[:160],
+            target,
+            eff_cap,
         )
 
-    # Seam-protected spatial slab simplification on CPU-staged tensors, followed by global simplify pass.
-    assert v_cpu is not None and f_cpu is not None
-    num_slabs = max(2, min(8, (f_count + 44_999_999) // 45_000_000))
-    span = v_cpu.max(dim=0).values - v_cpu.min(dim=0).values
-    axis = int(span.argmax().item())
-    v_ax = v_cpu[:, axis]
-    sample_stride = max(1, f_count // 500_000)
-    f_sample = f_cpu[::sample_stride].long()
-    sample_c = (v_ax[f_sample[:, 0]] + v_ax[f_sample[:, 1]] + v_ax[f_sample[:, 2]]) * (1.0 / 3.0)
-    qs = torch_mod.linspace(0.0, 1.0, num_slabs + 1, dtype=sample_c.dtype)[1:-1]
-    cuts = torch_mod.quantile(sample_c, qs)
-    del f_sample, sample_c
+    # Stage 1: Seam-locked, globally welded QEM coarsening down to ~48M-60M (well below eff_cap & >target so Stage 2 runs globally).
+    safe_s2_cap = max(target, int(eff_cap * 0.60))
+    if safe_s2_cap <= target:
+        safe_s2_cap = max(target, int(eff_cap * 0.90))
+    desired_mid = max(
+        target * 3 if eff_cap >= target * 4 else max(target + 1, int(target * 1.5)),
+        48_000_000 if f_count > 60_000_000 else min(f_count, target * 2),
+    )
+    mid_target = min(f_count, desired_mid, safe_s2_cap)
+    num_slabs = max(2, min(8, (f_count + 34_999_999) // 35_000_000))
 
-    face_slab = torch_mod.empty((f_count,), dtype=torch_mod.int16)
-    chunk_sz = 8_000_000
-    for s in range(0, f_count, chunk_sz):
-        e = min(s + chunk_sz, f_count)
-        f_sub = f_cpu[s:e].long()
-        c_sub = (v_ax[f_sub[:, 0]] + v_ax[f_sub[:, 1]] + v_ax[f_sub[:, 2]]) * (1.0 / 3.0)
-        face_slab[s:e].copy_(torch_mod.bucketize(c_sub, cuts).to(torch_mod.int16))
-    del cuts, v_ax
+    all_v, all_f = _weld_and_coarsen_slabs(
+        v_work, f_work, mid_target, num_slabs, torch_mod, use_cuda, phase_shift=0.0
+    )
+    del v_work, f_work
 
-    v_cnt_cpu = int(v_cpu.shape[0])
-    slab_count = torch_mod.zeros((v_cnt_cpu,), dtype=torch_mod.uint8)
-    for k in range(num_slabs):
-        v_in_k = torch_mod.zeros((v_cnt_cpu,), dtype=torch_mod.bool)
-        k_faces = f_cpu[face_slab == k]
-        for s in range(0, int(k_faces.shape[0]), chunk_sz):
-            e = min(s + chunk_sz, int(k_faces.shape[0]))
-            v_in_k[k_faces[s:e].reshape(-1).long()] = True
-        slab_count += v_in_k.to(torch_mod.uint8)
-        del k_faces, v_in_k
-    v_is_seam = slab_count > 1
-    del slab_count
+    # Stage 2: Single-shot global CuMesh.simplify(target) across the 100% welded intermediate mesh.
+    # Unifies density across former seam bands and eliminates slab boundary artifacts completely.
+    cur_f_cnt = int(all_f.shape[0])
+    if cur_f_cnt > target:
+        for attempt in range(2):
+            v_bak_s2 = all_v.cpu() if attempt == 0 else None
+            f_bak_s2 = all_f.cpu() if attempt == 0 else None
+            all_v_dev = all_v.to(work_dev).contiguous() if all_v.device != work_dev else all_v.contiguous()
+            all_f_dev = all_f.to(work_dev).contiguous() if all_f.device != work_dev else all_f.contiguous()
+            del all_v, all_f
+            try:
+                all_v, all_f = _run_cumesh_simplify_once(
+                    all_v_dev, all_f_dev, target, torch_mod, cumesh_mod, verbose=verbose, opts=opts
+                )
+                del v_bak_s2, f_bak_s2
+                break
+            except Exception as exc:
+                if not _is_oom_like(exc) or attempt >= 1 or v_bak_s2 is None or f_bak_s2 is None:
+                    raise
+                tighter_mid = max(target, int(cur_f_cnt * 0.65))
+                log.warning(
+                    "Stage-2 CuMesh.simplify(%d) hit VRAM limit at %d faces; coarsening shifted slabs -> %d and retrying",
+                    target,
+                    cur_f_cnt,
+                    tighter_mid,
+                )
+                v_retry = v_bak_s2.to(work_dev).contiguous()
+                f_retry = f_bak_s2.to(work_dev).contiguous()
+                del v_bak_s2, f_bak_s2
+                all_v, all_f = _weld_and_coarsen_slabs(
+                    v_retry, f_retry, tighter_mid, num_slabs, torch_mod, use_cuda, phase_shift=0.5
+                )
+                cur_f_cnt = int(all_f.shape[0])
+                if cur_f_cnt <= target:
+                    break
 
-    is_seam_face = torch_mod.zeros((f_count,), dtype=torch_mod.bool)
-    for s in range(0, f_count, chunk_sz):
-        e = min(s + chunk_sz, f_count)
-        f_sub = f_cpu[s:e].long()
-        is_seam_face[s:e] = v_is_seam[f_sub[:, 0]] | v_is_seam[f_sub[:, 1]] | v_is_seam[f_sub[:, 2]]
-    del v_is_seam
-
-    seam_faces = f_cpu[is_seam_face]
-    seam_count = int(seam_faces.shape[0])
-    interior_budget = max(target // 2, int(target * 1.15) - seam_count)
-    interior_mask = ~is_seam_face
-    del is_seam_face
-    interior_total = max(1, int(interior_mask.sum().item()))
-
-    merged_verts: list[Any] = []
-    merged_faces: list[Any] = []
-    v_offset = 0
-    if seam_count > 0:
-        sv, sf = _compact_mesh_vertices(v_cpu, seam_faces, torch_mod)
-        merged_verts.append(sv)
-        merged_faces.append(sf + v_offset)
-        v_offset += int(sv.shape[0])
-    del seam_faces
-
-    for k in range(num_slabs):
-        slab_faces = f_cpu[interior_mask & (face_slab == k)]
-        k_cnt = int(slab_faces.shape[0])
-        if k_cnt == 0:
-            continue
-        k_target = max(1, int(round(interior_budget * (k_cnt / interior_total))))
-        vk, fk = _compact_mesh_vertices(v_cpu, slab_faces, torch_mod)
-        del slab_faces
-        vk_dev = vk.to(work_dev).contiguous()
-        fk_dev = fk.to(work_dev).contiguous()
-        del vk, fk
-        cm_k = cumesh_mod.CuMesh()
-        cm_k.init(vk_dev, fk_dev)
-        del vk_dev, fk_dev
-        gc.collect()
-        if use_cuda:
-            torch_mod.cuda.empty_cache()
-        cm_k.simplify(min(k_target, k_cnt), verbose=verbose, options=opts)
-        vk_out, fk_out = cm_k.read()
-        del cm_k
-        gc.collect()
-        if use_cuda:
-            torch_mod.cuda.empty_cache()
-        merged_verts.append(vk_out.cpu())
-        merged_faces.append(fk_out.cpu() + v_offset)
-        v_offset += int(vk_out.shape[0])
-        del vk_out, fk_out
-
-    del v_cpu, f_cpu, interior_mask, face_slab
-    all_v = torch_mod.cat(merged_verts, dim=0) if merged_verts else torch_mod.empty((0, 3), dtype=torch_mod.float32)
-    all_f = torch_mod.cat(merged_faces, dim=0) if merged_faces else torch_mod.empty((0, 3), dtype=torch_mod.int32)
-    del merged_verts, merged_faces
-
-    if int(all_f.shape[0]) > target:
-        all_v_dev = all_v.to(work_dev).contiguous()
-        all_f_dev = all_f.to(work_dev).contiguous()
-        del all_v, all_f
-        cm_final = cumesh_mod.CuMesh()
-        cm_final.init(all_v_dev, all_f_dev)
-        del all_v_dev, all_f_dev
-        gc.collect()
-        if use_cuda:
-            torch_mod.cuda.empty_cache()
-        cm_final.simplify(target, verbose=verbose, options=opts)
-        all_v, all_f = cm_final.read()
-        del cm_final
-        gc.collect()
-        if use_cuda:
-            torch_mod.cuda.empty_cache()
-        all_v, all_f = _compact_mesh_vertices(all_v, all_f, torch_mod)
     mesh_obj.vertices = all_v.to(orig_dev) if all_v.device != orig_dev else all_v
     mesh_obj.faces = all_f.to(orig_dev) if all_f.device != orig_dev else all_f
 
