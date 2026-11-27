@@ -3246,10 +3246,12 @@ def _qem_coarsen_slab_locked(
     is_locked: Any,
     target_faces: int,
     torch_mod: Any,
-    lambda_el: float = 1e-3,
-    max_iters: int = 24,
+    lambda_el: float = 1e-2,
+    max_iters: int = 28,
+    lambda_skinny: float = 1e-3,
+    min_normal_cos: float = 0.25,
 ) -> tuple[Any, Any]:
-    """Vectorized GPU/CPU QEM edge-collapse that keeps locked/seam/boundary vertices fixed in place."""
+    """Vectorized GPU/CPU QEM edge-collapse preserving manifold links, triangle shape, and locked seams."""
     dev = v_sub.device
     v_cnt = int(v_sub.shape[0])
     f_cur = int(f_sub.shape[0])
@@ -3261,17 +3263,23 @@ def _qem_coarsen_slab_locked(
     p_max = v_sub.max(dim=0).values
     center = 0.5 * (p_min + p_max)
     inv_scale = 2.0 / max(float((p_max - p_min).max().item()), 1e-8)
-    p = (v_sub - center) * inv_scale
+    p = (v_sub.float() - center) * inv_scale
 
-    # Chunked initial per-vertex quadrics (keeps peak VRAM small even on 40M+ face slabs)
+    # Chunked initial per-vertex quadrics and triangle skinny metric (matches CuMesh regularizers)
     qem = torch_mod.zeros((v_cnt, 10), dtype=torch_mod.float32, device=dev)
+    v_skinny = torch_mod.zeros((v_cnt,), dtype=torch_mod.float32, device=dev)
+    v_deg = torch_mod.zeros((v_cnt,), dtype=torch_mod.float32, device=dev)
     face_chunk = 4_000_000
     for s in range(0, f_cur, face_chunk):
         e = min(s + face_chunk, f_cur)
         fc = f[s:e].long()
         p0, p1, p2 = p[fc[:, 0]], p[fc[:, 1]], p[fc[:, 2]]
-        n = torch_mod.cross(p1 - p0, p2 - p0, dim=-1)
+        e01 = p1 - p0
+        e12 = p2 - p1
+        e20 = p0 - p2
+        n = torch_mod.cross(e01, p2 - p0, dim=-1)
         nl = n.norm(dim=-1, keepdim=True)
+        nl_s = nl.squeeze(-1)
         n = torch_mod.where(nl > 1e-12, n / nl.clamp_min(1e-12), torch_mod.zeros_like(n))
         d = -(n * p0).sum(dim=-1)
         nx, ny, nz = n[:, 0], n[:, 1], n[:, 2]
@@ -3279,12 +3287,22 @@ def _qem_coarsen_slab_locked(
             [nx * nx, nx * ny, nx * nz, ny * ny, ny * nz, nz * nz, nx * d, ny * d, nz * d, d * d],
             dim=-1,
         )
+        denom = (e01.pow(2).sum(dim=-1) + e12.pow(2).sum(dim=-1) + e20.pow(2).sum(dim=-1)).clamp_min(1e-12)
+        skinny_f = 1.0 - (2.0 * 1.7320508 * nl_s / denom).clamp(0.0, 1.0)
+        ones_f = torch_mod.ones_like(skinny_f)
         for col in range(3):
             qem.index_add_(0, fc[:, col], fq)
-        del fc, p0, p1, p2, n, nl, d, nx, ny, nz, fq
+            v_skinny.index_add_(0, fc[:, col], skinny_f)
+            v_deg.index_add_(0, fc[:, col], ones_f)
+        del fc, p0, p1, p2, e01, e12, e20, n, nl, nl_s, d, nx, ny, nz, fq, denom, skinny_f, ones_f
+
+    avg_skinny_v = v_skinny / v_deg.clamp_min(1.0)
+    del v_skinny, v_deg
 
     sentinel = 1 << 62
     edge_chunk = 4_000_000
+    bad_edge_keys = torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+    max_bad_keys = 2_000_000
 
     for _it in range(max_iters):
         f_cur = int(f.shape[0])
@@ -3307,7 +3325,6 @@ def _qem_coarsen_slab_locked(
 
         e0 = u_edges >> 32
         e1 = u_edges & 0xFFFFFFFF
-        del u_edges
 
         # Protect seam vertices, natural open boundaries, and non-manifold vertices from any collapse
         prot_nm = is_locked.clone()
@@ -3325,10 +3342,12 @@ def _qem_coarsen_slab_locked(
 
         free_mask = (~prot[e0]) & (~prot[e1])
         if not bool(free_mask.any()):
-            # Fallback for thin open ribbons (e.g. single-strip hair tips) where every edge touches a natural boundary;
-            # seam vertices (`is_locked`) and non-manifold vertices (`prot_nm`) remain strictly immovable.
+            # Fallback for thin open ribbons where every edge touches a natural boundary;
+            # seam vertices (`is_locked`) and non-manifold vertices (`prot_nm`) stay immovable.
             free_mask = (~prot_nm[e0]) & (~prot_nm[e1])
-        del prot, prot_nm
+        if bool(bad_edge_keys.numel() > 0) and bool(free_mask.any()):
+            free_mask &= ~torch_mod.isin(u_edges, bad_edge_keys)
+        del u_edges, prot, prot_nm
         c0 = e0[free_mask]
         c1 = e1[free_mask]
         del e0, e1, free_mask
@@ -3337,9 +3356,8 @@ def _qem_coarsen_slab_locked(
         if m == 0:
             break
 
-        # Chunked edge QEM evaluation -> stores only float32 cost + uint8 endpoint choice (0=mid, 1=v0, 2=v1)
+        # Regularized midpoint QEM cost (CuMesh-faithful; avoids pulling eyeballs onto mask rims)
         costs = torch_mod.empty((m,), dtype=torch_mod.float32, device=dev)
-        choices = torch_mod.empty((m,), dtype=torch_mod.uint8, device=dev)
         for s in range(0, m, edge_chunk):
             e = min(s + edge_chunk, m)
             s0, s1 = c0[s:e], c1[s:e]
@@ -3347,40 +3365,37 @@ def _qem_coarsen_slab_locked(
             pm_c = 0.5 * (p0_c + p1_c)
             eq_c = qem[s0] + qem[s1]
             qm_c = _eval_qem_points(eq_c, pm_c)
-            q0_c = _eval_qem_points(eq_c, p0_c)
-            q1_c = _eval_qem_points(eq_c, p1_c)
-            best_q, best_ch = torch_mod.stack([qm_c, q0_c, q1_c], dim=-1).min(dim=-1)
-            l2_c = ((p1_c - p0_c) ** 2).sum(dim=-1)
-            costs[s:e] = best_q + lambda_el * l2_c
-            choices[s:e] = best_ch.to(torch_mod.uint8)
-            del s0, s1, p0_c, p1_c, pm_c, eq_c, qm_c, q0_c, q1_c, best_q, best_ch, l2_c
+            l2_c = (p1_c - p0_c).pow(2).sum(dim=-1)
+            sk_c = 0.5 * (avg_skinny_v[s0] + avg_skinny_v[s1])
+            costs[s:e] = qm_c + (lambda_el + lambda_skinny * sk_c) * l2_c
+            del s0, s1, p0_c, p1_c, pm_c, eq_c, qm_c, l2_c, sk_c
 
         remove_need = f_cur - target_faces
-        frac = min(1.0, max(0.20, (remove_need / max(1, 2 * m)) * 5.0))
+        frac = min(1.0, max(0.25, (remove_need / max(1, 2 * m)) * 5.0))
         if frac < 0.99 and m > 256:
             # Sample <=500k elements before torch.quantile (PyTorch limits quantile() to <= 2^24 elements)
             c_samp = costs[:: max(1, m // 500_000)].float()
             cutoff = torch_mod.quantile(c_samp, frac)
             sel = costs <= cutoff
-            c0, c1, choices, costs = c0[sel], c1[sel], choices[sel], costs[sel]
+            c0, c1, costs = c0[sel], c1[sel], costs[sel]
             del c_samp, cutoff, sel
             m = int(c0.shape[0])
             if m == 0:
-                del costs, choices
+                del costs
                 break
 
-        # Quantize QEM cost into 16 log-scale tiers (bits 58..61) + 31-bit avalanche hash + 27-bit edge id
+        # 32 log-cost tiers + avalanche hash tie-break prevents monotonic-chain stalling while keeping cost order
         log_c = torch_mod.log10(costs.float().clamp_min(1e-12))
         log_lo = float(log_c.min().item())
         log_hi = max(log_lo + 0.5, float(log_c.max().item()))
-        tier = torch_mod.clamp(((log_c - log_lo) / (log_hi - log_lo) * 15.99).to(torch_mod.int64), 0, 15)
+        tier = torch_mod.clamp(((log_c - log_lo) / (log_hi - log_lo) * 31.99).to(torch_mod.int64), 0, 31)
         z = ((c0 + 1) * 2654435761) ^ ((c1 + 1) * 2246822519) ^ ((_it + 1) * 3266489917)
         z = (z ^ (z >> 16)) * 3266489917
         z = (z ^ (z >> 15)) * 2654435761
-        h = (z ^ (z >> 17)) & ((1 << 31) - 1)
+        h = (z ^ (z >> 17)) & ((1 << 30) - 1)
         eid_low = torch_mod.arange(m, dtype=torch_mod.int64, device=dev) & ((1 << 27) - 1)
-        keys = (tier << 58) | (h << 27) | eid_low
-        del costs, log_c, tier, z, h, eid_low
+        keys = (tier << 57) | (h << 27) | eid_low
+        del log_c, tier, z, h, eid_low
 
         # Strictly 2-hop / 1-ring disjoint independent set (no two winners touch the same face)
         v_best = torch_mod.full((v_cnt,), sentinel, dtype=torch_mod.int64, device=dev)
@@ -3403,30 +3418,26 @@ def _qem_coarsen_slab_locked(
         del v_win, keys
         wc0 = c0[win_mask]
         wc1 = c1[win_mask]
-        wch = choices[win_mask]
-        del c0, c1, choices, win_mask
+        w_cost = costs[win_mask]
+        del c0, c1, costs, win_mask
 
         w_cnt = int(wc0.shape[0])
         if w_cnt == 0:
             break
 
-        max_collapses = max(1, (f_cur - target_faces + 1) // 2)
+        # Sort winners by exact cost BEFORE capping so lowest-error edges collapse uniformly across the slab
+        max_collapses = max(1, (remove_need + 1) // 2)
         if w_cnt > max_collapses:
-            wc0 = wc0[:max_collapses]
-            wc1 = wc1[:max_collapses]
-            wch = wch[:max_collapses]
+            ord_w = torch_mod.argsort(w_cost)[:max_collapses]
+            wc0 = wc0[ord_w]
+            wc1 = wc1[ord_w]
             w_cnt = max_collapses
+            del ord_w
+        del w_cost
 
-        p0_w, p1_w = p[wc0], p[wc1]
-        pm_w = 0.5 * (p0_w + p1_w)
-        w_p = torch_mod.where(
-            (wch == 1).unsqueeze(-1),
-            p0_w,
-            torch_mod.where((wch == 2).unsqueeze(-1), p1_w, pm_w),
-        )
-        del p0_w, p1_w, pm_w, wch
+        w_p = 0.5 * (p[wc0] + p[wc1])
 
-        # Tentative collapse validation: reject normal flips, zero-area slivers, and non-manifold pinches
+        # Tentative collapse validation: reject normal flips, slivers, link-condition pinches, and non-manifold merges
         v_to = torch_mod.arange(v_cnt, dtype=torch_mod.int32, device=dev)
         v_to[wc1] = wc0.to(torch_mod.int32)
         p_tent = p.clone()
@@ -3441,6 +3452,8 @@ def _qem_coarsen_slab_locked(
         orig_chunks: list[Any] = []
         new_chunks: list[Any] = []
         tag_chunks: list[Any] = []
+        del_opp_v: list[Any] = []
+        del_opp_t: list[Any] = []
         for s in range(0, f_cur, face_chunk):
             e = min(s + face_chunk, f_cur)
             f_sub_c = f[s:e].long()
@@ -3457,6 +3470,15 @@ def _qem_coarsen_slab_locked(
                     orig_chunks.append(fo_c[sv_c])
                     new_chunks.append(fn_c[sv_c])
                     tag_chunks.append(ftg_c[sv_c])
+                d_mask = ~sv_c
+                if bool(d_mask.any()):
+                    df = fn_c[d_mask]
+                    dt = ftg_c[d_mask]
+                    keep_col_d = df == wc0[dt.long()].unsqueeze(-1)
+                    valid_del = (~keep_col_d).sum(dim=-1) == 1
+                    if bool(valid_del.any()):
+                        del_opp_v.append(df[valid_del][~keep_col_d[valid_del]])
+                        del_opp_t.append(dt[valid_del])
         del w_tag, v_to
 
         win_ok = torch_mod.ones((w_cnt,), dtype=torch_mod.bool, device=dev)
@@ -3466,57 +3488,109 @@ def _qem_coarsen_slab_locked(
             f_s_tag = torch_mod.cat(tag_chunks, dim=0)
             del orig_chunks, new_chunks, tag_chunks
 
-            old_n = torch_mod.cross(
-                p[f_s_orig[:, 1]] - p[f_s_orig[:, 0]],
-                p[f_s_orig[:, 2]] - p[f_s_orig[:, 0]],
-                dim=-1,
-            )
-            new_n = torch_mod.cross(
-                p_tent[f_s_new[:, 1]] - p_tent[f_s_new[:, 0]],
-                p_tent[f_s_new[:, 2]] - p_tent[f_s_new[:, 0]],
-                dim=-1,
-            )
+            old_p = p[f_s_orig]
+            new_p = p_tent[f_s_new]
+            oe1 = old_p[:, 1] - old_p[:, 0]
+            oe2 = old_p[:, 2] - old_p[:, 0]
+            ne1 = new_p[:, 1] - new_p[:, 0]
+            ne2 = new_p[:, 2] - new_p[:, 0]
+            old_n = torch_mod.cross(oe1, oe2, dim=-1)
+            new_n = torch_mod.cross(ne1, ne2, dim=-1)
             on_l = old_n.norm(dim=-1)
             nn_l = new_n.norm(dim=-1)
-            bad_flip = ((old_n * new_n).sum(dim=-1) <= 1e-6 * on_l * nn_l) | (nn_l <= 1e-12)
-            if bool(bad_flip.any()):
-                win_ok[f_s_tag[bad_flip].long()] = False
-            del old_n, new_n, on_l, nn_l, bad_flip, f_s_orig
-
-            is_keep_col = f_s_new == wc0[f_s_tag.long()].unsqueeze(-1)
-            others = f_s_new[~is_keep_col].reshape(-1, 2)
-            del is_keep_col, f_s_new
-            e_ku = torch_mod.cat(
-                [
-                    torch_mod.stack([f_s_tag.long(), others[:, 0]], dim=-1),
-                    torch_mod.stack([f_s_tag.long(), others[:, 1]], dim=-1),
-                ],
-                dim=0,
+            oe0 = old_p[:, 2] - old_p[:, 1]
+            ne0 = new_p[:, 2] - new_p[:, 1]
+            o_l2 = (oe0.pow(2).sum(dim=-1) + oe1.pow(2).sum(dim=-1) + oe2.pow(2).sum(dim=-1)).clamp_min(1e-12)
+            n_l2 = (ne0.pow(2).sum(dim=-1) + ne1.pow(2).sum(dim=-1) + ne2.pow(2).sum(dim=-1)).clamp_min(1e-12)
+            o_shape = 2.0 * 1.7320508 * on_l / o_l2
+            n_shape = 2.0 * 1.7320508 * nn_l / n_l2
+            bad_tri = (
+                ((old_n * new_n).sum(dim=-1) <= min_normal_cos * on_l * nn_l)
+                | (nn_l <= 1e-12)
+                | (nn_l <= 1e-3 * on_l)
+                | ((n_shape < 0.08 * o_shape) & (n_shape < 0.08))
             )
-            u_ku, ku_cnts = torch_mod.unique((e_ku[:, 0] << 32) | e_ku[:, 1], return_counts=True)
-            del e_ku
-            bad_nm = ku_cnts > 2
-            if bool(bad_nm.any()):
-                win_ok[u_ku[bad_nm] >> 32] = False
-            del u_ku, ku_cnts, bad_nm
+            if bool(bad_tri.any()):
+                win_ok[f_s_tag[bad_tri].long()] = False
+            del old_p, new_p, oe0, oe1, oe2, ne0, ne1, ne2, old_n, new_n, on_l, nn_l, o_l2, n_l2, o_shape, n_shape, bad_tri
 
-            olo = torch_mod.minimum(others[:, 0], others[:, 1])
-            ohi = torch_mod.maximum(others[:, 0], others[:, 1])
-            dup_key = torch_mod.stack([f_s_tag.long(), olo, ohi], dim=-1)
-            u_dk, u_dc = torch_mod.unique(dup_key, dim=0, return_counts=True)
-            bad_dup = u_dc > 1
-            if bool(bad_dup.any()):
-                win_ok[u_dk[bad_dup][:, 0]] = False
-            del others, olo, ohi, dup_key, u_dk, u_dc, bad_dup, f_s_tag
+            t_l = f_s_tag.long()
+            is_keep_col = f_s_new == wc0[t_l].unsqueeze(-1)
+            valid_s = is_keep_col.sum(dim=-1) == 1
+            if bool((~valid_s).any()):
+                win_ok[t_l[~valid_s]] = False
+            if bool(valid_s.any()):
+                f_so_v = f_s_orig[valid_s]
+                f_sn_v = f_s_new[valid_s]
+                t_lv = t_l[valid_s]
+                keep_v = is_keep_col[valid_s]
+                others = f_sn_v[~keep_v].reshape(-1, 2)
+                is_c0 = (f_so_v == wc0[t_lv].unsqueeze(-1)).any(dim=-1)
+                is_c1 = (f_so_v == wc1[t_lv].unsqueeze(-1)).any(dim=-1)
+                o_c0, t_c0 = others[is_c0], t_lv[is_c0]
+                o_c1, t_c1 = others[is_c1], t_lv[is_c1]
+                p_c0 = (
+                    torch_mod.unique(torch_mod.cat([(t_c0 << 32) | o_c0[:, 0], (t_c0 << 32) | o_c0[:, 1]]))
+                    if bool(t_c0.numel() > 0)
+                    else torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+                )
+                p_c1 = (
+                    torch_mod.unique(torch_mod.cat([(t_c1 << 32) | o_c1[:, 0], (t_c1 << 32) | o_c1[:, 1]]))
+                    if bool(t_c1.numel() > 0)
+                    else torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+                )
+                u01, c01 = torch_mod.unique(torch_mod.cat([p_c0, p_c1]), return_counts=True)
+                inter = u01[c01 == 2]
+                if bool(inter.numel() > 0):
+                    if del_opp_v:
+                        d_keys = torch_mod.unique(
+                            (torch_mod.cat(del_opp_t).long() << 32) | torch_mod.cat(del_opp_v).long()
+                        )
+                        bad_link = inter[~torch_mod.isin(inter, d_keys)]
+                        del d_keys
+                    else:
+                        bad_link = inter
+                    if bool(bad_link.numel() > 0):
+                        win_ok[bad_link >> 32] = False
+                    del bad_link
+                del o_c0, t_c0, o_c1, t_c1, p_c0, p_c1, u01, c01, inter
+
+                e_ku = torch_mod.cat(
+                    [torch_mod.stack([t_lv, others[:, 0]], dim=-1), torch_mod.stack([t_lv, others[:, 1]], dim=-1)],
+                    dim=0,
+                )
+                u_ku, ku_cnts = torch_mod.unique((e_ku[:, 0] << 32) | e_ku[:, 1], return_counts=True)
+                bad_nm = ku_cnts > 2
+                if bool(bad_nm.any()):
+                    win_ok[u_ku[bad_nm] >> 32] = False
+                del e_ku, u_ku, ku_cnts, bad_nm
+
+                olo = torch_mod.minimum(others[:, 0], others[:, 1])
+                ohi = torch_mod.maximum(others[:, 0], others[:, 1])
+                dup_key = torch_mod.stack([t_lv, olo, ohi], dim=-1)
+                u_dk, u_dc = torch_mod.unique(dup_key, dim=0, return_counts=True)
+                bad_dup = u_dc > 1
+                if bool(bad_dup.any()):
+                    win_ok[u_dk[bad_dup][:, 0]] = False
+                del f_so_v, f_sn_v, t_lv, keep_v, others, is_c0, is_c1, olo, ohi, dup_key, u_dk, u_dc, bad_dup
+            del f_s_orig, f_s_new, f_s_tag, is_keep_col, valid_s, t_l
         else:
             del orig_chunks, new_chunks, tag_chunks
+        del del_opp_v, del_opp_t, p_tent
 
-        del p_tent
+        if bool((~win_ok).any()) and int(bad_edge_keys.numel()) < max_bad_keys:
+            rej0 = torch_mod.minimum(wc0[~win_ok], wc1[~win_ok])
+            rej1 = torch_mod.maximum(wc0[~win_ok], wc1[~win_ok])
+            bad_edge_keys = torch_mod.unique(torch_mod.cat([bad_edge_keys, (rej0 << 32) | rej1]))
+            del rej0, rej1
+
         wc0 = wc0[win_ok]
         wc1 = wc1[win_ok]
         w_p = w_p[win_ok]
         del win_ok
         if int(wc0.shape[0]) == 0:
+            if int(bad_edge_keys.numel()) > 0 and int(bad_edge_keys.numel()) < max_bad_keys:
+                continue
             break
 
         # Commit verified collapses
@@ -3524,6 +3598,7 @@ def _qem_coarsen_slab_locked(
         v_to[wc1] = wc0.to(torch_mod.int32)
         p[wc0] = w_p
         qem[wc0] += qem[wc1]
+        avg_skinny_v[wc0] = 0.5 * (avg_skinny_v[wc0] + avg_skinny_v[wc1])
         del wc0, wc1, w_p
 
         surv_list: list[Any] = []
@@ -3537,7 +3612,7 @@ def _qem_coarsen_slab_locked(
         f = torch_mod.cat(surv_list, dim=0) if surv_list else torch_mod.empty((0, 3), dtype=torch_mod.int32, device=dev)
         del surv_list
 
-    del qem
+    del qem, avg_skinny_v, bad_edge_keys
     v_out = (p / inv_scale) + center
     return v_out.to(v_sub.dtype), f
 
@@ -4413,7 +4488,16 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
 
             mesh = cumesh_local.CuMesh()
             mesh.init(vertices, faces)
-            mesh.fill_holes(max_hole_perimeter=3e-2)
+            try:
+                mesh.fill_holes(max_hole_perimeter=3e-2)
+            except Exception as fh_exc:
+                if not _is_oom_like(fh_exc) or not remesh:
+                    raise
+                if fh_exc.__traceback__ is not None:
+                    traceback.clear_frames(fh_exc.__traceback__)
+                _clear_sticky_cuda_error(t_mod)
+                _flush_allocator_for_cpp()
+                log.warning("Skipping CuMesh.fill_holes before remesh after VRAM OOM (%s)", fh_exc)
             if verbose:
                 print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
             vertices, faces = mesh.read()
@@ -4421,7 +4505,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 pbar.update(1)
 
             if remesh:
-                # Destroy initial 16M+ face C++ CuMesh buffers before building cuBVH & Dual Contouring
+                # Destroy initial high-face C++ CuMesh buffers before building cuBVH & Dual Contouring
                 del mesh
                 mesh = None
                 _flush_allocator_for_cpp()
@@ -4481,6 +4565,8 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                         if vertices is None:
                             vertices = _to_dev(orig_verts_cpu)
                             faces = _to_dev(orig_faces_cpu)
+                        if bvh is None:
+                            bvh = cumesh_local.cuBVH(vertices, faces)
                         _flush_allocator_for_cpp()
                         dc_verts, dc_faces = cumesh_local.remeshing.remesh_narrow_band_dc(
                             vertices,
@@ -4493,6 +4579,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                             verbose=verbose,
                             bvh=bvh,
                         )
+                        dc_f_cnt = int(dc_faces.shape[0])
                         if stage_vol_cpu and vertices is not None:
                             orig_verts_cpu = vertices.cpu()
                             orig_faces_cpu = faces.cpu()
@@ -4503,6 +4590,18 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                         del dc_verts, dc_faces
                         dc_verts = None
                         dc_faces = None
+                        # Release cuBVH before high-face single-shot CuMesh.simplify when VRAM is tight;
+                        # Stage 5 rebuilds cuBVH cleanly from orig_verts_cpu after uv_unwrap frees mesh.
+                        if bvh is not None and dc_f_cnt > 25_000_000 and use_cuda:
+                            if vertices is not None:
+                                orig_verts_cpu = vertices.cpu()
+                                orig_faces_cpu = faces.cpu()
+                                vertices = None
+                                faces = None
+                            free_pre_simp = _cuda_free_gb(t_mod)
+                            if free_pre_simp is None or (free_pre_simp * (1024**3)) < (dc_f_cnt * 185 * 1.15):
+                                del bvh
+                                bvh = None
                         # Release all PyTorch cached segments BEFORE CuMesh C++ simplify calls raw cudaMalloc()
                         _flush_allocator_for_cpp()
                         if verbose:
@@ -4510,6 +4609,16 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                         mesh.simplify(decimation_target, verbose=verbose)
                         if verbose:
                             print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                        # Clean non-manifold pinches/duplicate/sliver faces created during high-ratio DC simplify
+                        # before uv_unwrap so xatlas charts do not fragment across non-manifold edges.
+                        if hasattr(mesh, "remove_degenerate_faces"):
+                            mesh.remove_degenerate_faces()
+                        if hasattr(mesh, "remove_duplicate_faces"):
+                            mesh.remove_duplicate_faces()
+                        if hasattr(mesh, "remove_small_connected_components"):
+                            mesh.remove_small_connected_components(1e-5)
+                        if hasattr(mesh, "repair_non_manifold_edges"):
+                            mesh.repair_non_manifold_edges()
                         break
                     except Exception as remesh_exc:
                         if remesh_exc.__traceback__ is not None:
@@ -4599,6 +4708,8 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             if vertices is None:
                 vertices = _to_dev(orig_verts_cpu)
                 faces = _to_dev(orig_faces_cpu)
+            if bvh is None:
+                bvh = cumesh_local.cuBVH(vertices, faces)
             del orig_verts_cpu, orig_faces_cpu
 
             n_valid = int(valid_pos.shape[0])
@@ -4619,7 +4730,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 valid_pos = projected_pos
                 del projected_pos
 
-            # Free cuBVH + original 16M-face Dual-Grid mesh BEFORE moving PBR voxel volume onto GPU
+            # Free cuBVH + pre-remesh Dual-Grid mesh BEFORE moving PBR voxel volume onto GPU
             del bvh, vertices, faces
             _flush_allocator_for_cpp()
 
@@ -4631,13 +4742,54 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 texture_size, texture_size, attr_channels, device=target_dev, dtype=attr_vol_dev.dtype
             )
             if n_valid > 0:
-                attrs[mask] = grid_sample_fn(
+                grid_coords = (valid_pos - aabb[0]) / voxel_size
+                coords_batch = t_mod.cat([t_mod.zeros_like(coords_dev[:, :1]), coords_dev], dim=-1)
+                vol_shape = t_mod.Size([1, attr_channels, *grid_size.tolist()])
+                sampled = grid_sample_fn(
                     attr_vol_dev,
-                    t_mod.cat([t_mod.zeros_like(coords_dev[:, :1]), coords_dev], dim=-1),
-                    shape=t_mod.Size([1, attr_channels, *grid_size.tolist()]),
-                    grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+                    coords_batch,
+                    shape=vol_shape,
+                    grid=grid_coords.reshape(1, -1, 3),
                     mode="trilinear",
                 )
+                sampled_flat = sampled[0] if (sampled.ndim == 3 and int(sampled.shape[0]) == 1) else sampled
+                # Recover rare empty-voxel misses (<1 voxel drift from surface simplification) from adjacent voxels
+                alpha_slice = attr_layout.get("alpha")
+                if alpha_slice is not None and sampled_flat.ndim == 2 and int(sampled_flat.shape[0]) == n_valid:
+                    best_a = sampled_flat[..., alpha_slice].amax(dim=-1)
+                    miss_mask = best_a <= 1e-3
+                    n_miss = int(miss_mask.sum().item())
+                    if 0 < n_miss < n_valid:
+                        sampled_flat = sampled_flat.clone()
+                        miss_grid = grid_coords[miss_mask]
+                        miss_vals = sampled_flat[miss_mask]
+                        miss_best_a = best_a[miss_mask]
+                        for delta in (
+                            (0.85, 0.0, 0.0),
+                            (-0.85, 0.0, 0.0),
+                            (0.0, 0.85, 0.0),
+                            (0.0, -0.85, 0.0),
+                            (0.0, 0.0, 0.85),
+                            (0.0, 0.0, -0.85),
+                        ):
+                            d_vec = t_mod.tensor(delta, dtype=miss_grid.dtype, device=miss_grid.device)
+                            probe = grid_sample_fn(
+                                attr_vol_dev,
+                                coords_batch,
+                                shape=vol_shape,
+                                grid=(miss_grid + d_vec).reshape(1, -1, 3),
+                                mode="trilinear",
+                            )
+                            probe_flat = probe[0] if (probe.ndim == 3 and int(probe.shape[0]) == 1) else probe
+                            probe_a = probe_flat[..., alpha_slice].amax(dim=-1)
+                            better = (probe_a > miss_best_a) & (probe_a > 1e-3)
+                            if bool(better.any()):
+                                miss_vals = t_mod.where(better.unsqueeze(-1), probe_flat, miss_vals)
+                                miss_best_a = t_mod.maximum(miss_best_a, probe_a)
+                        sampled_flat[miss_mask] = miss_vals
+                        del miss_grid, miss_vals, miss_best_a
+                attrs[mask] = sampled_flat
+                del grid_coords, coords_batch, sampled, sampled_flat
             del attr_vol_dev, coords_dev, valid_pos
             _flush_allocator_for_cpp()
 
@@ -4662,6 +4814,9 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             alpha_mode = "OPAQUE"
 
             mask_inv = (~mask_np).astype(np_mod.uint8)
+            if bool((mask_np & (alpha[..., 0] >= 8)).any()):
+                miss_uv = (mask_np & (alpha[..., 0] < 8)).astype(np_mod.uint8)
+                mask_inv = np_mod.maximum(mask_inv, miss_uv)
             base_color, metallic, roughness, alpha = _parallel_pbr_inpaint(
                 base_color, metallic, roughness, alpha, mask_inv
             )
@@ -6117,7 +6272,11 @@ class Trellis2Engine:
 
             m = meshes[0]
             del meshes
-            max_rast_faces = 16_777_216
+            max_rast_faces = (
+                int(os.environ.get("TRELLIS2_PRE_REMESH_MAX_FACES", "33554432"))
+                if params.remesh
+                else 16_777_216
+            )
             if (
                 getattr(getattr(m, "vertices", None), "is_cuda", False)
                 and getattr(getattr(m, "faces", None), "is_cuda", False)
@@ -6371,7 +6530,12 @@ class Trellis2Engine:
                     self._release_vram(offload_models=True)
 
                 _emit("simplifying_mesh")
-                mesh.simplify(16777216)  # exact upstream nvdiffrast hardware face limit (no-op when <=16.77M)
+                pre_bake_max_faces = (
+                    int(os.environ.get("TRELLIS2_PRE_REMESH_MAX_FACES", "33554432"))
+                    if params.remesh
+                    else 16_777_216
+                )
+                mesh.simplify(pre_bake_max_faces)
 
                 _emit("baking_textures")
                 t_bake = time.monotonic()
