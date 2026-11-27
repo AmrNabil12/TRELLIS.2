@@ -145,6 +145,8 @@ def _flush_flex_gemm_autotune_cache() -> None:
         "flex_gemm.utils.autotuner",
         "flex_gemm.ops.spconv",
         "flex_gemm.kernels.triton.spconv.config",
+        "flex_gemm.autotuner",
+        "flex_gemm.autotune",
     ):
         try:
             mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
@@ -3095,7 +3097,10 @@ def _compact_mesh_vertices(
     used = torch_mod.zeros((v_count,), dtype=torch_mod.bool, device=dev)
     for s in range(0, f_count, face_chunk):
         e = min(s + face_chunk, f_count)
-        used[faces[s:e].reshape(-1).long()] = True
+        f_slice = faces[s:e]
+        if f_slice.device != dev:
+            f_slice = f_slice.to(dev)
+        used[f_slice.reshape(-1).long()] = True
 
     keep_idx = used.nonzero(as_tuple=True)[0]
     del used
@@ -3111,13 +3116,211 @@ def _compact_mesh_vertices(
     new_faces = torch_mod.empty_like(faces, device=dev)
     for s in range(0, f_count, face_chunk):
         e = min(s + face_chunk, f_count)
-        new_faces[s:e].copy_(remap[faces[s:e].long()])
+        f_slice = faces[s:e]
+        if f_slice.device != dev:
+            f_slice = f_slice.to(dev)
+        new_faces[s:e].copy_(remap[f_slice.long()])
     del remap
     return new_vertices, new_faces
 
 
-def patch_mesh_simplify_noop(mesh_cls: Any, torch_mod: Any = None) -> None:
-    """Skip redundant CuMesh 12M-triangle build+readback when face count is already <= target (e.g. 16,777,216)."""
+def _simplify_mesh_oom_safe(
+    mesh_obj: Any,
+    target: int,
+    torch_mod: Any,
+    cumesh_mod: Any,
+    verbose: bool = False,
+    options: dict[str, Any] | None = None,
+) -> None:
+    """Simplify Mesh via CuMesh without duplicating VRAM, with seam-protected slab fallback on OOM."""
+    verts = mesh_obj.vertices
+    faces = mesh_obj.faces
+    if verts is None or faces is None:
+        return
+    f_count = int(faces.shape[0])
+    if f_count <= target:
+        return
+
+    opts = options or {}
+    use_cuda = bool(torch_mod.cuda.is_available())
+    orig_dev = verts.device
+    work_dev = torch_mod.device("cuda") if use_cuda else orig_dev
+
+    # Keep CPU copy on CPU inputs (zero-copy) or oversized GPU meshes so OOM can recover into slabs.
+    keep_backup = bool(orig_dev.type != "cuda" or f_count > 16_777_216)
+    v_cpu = verts.cpu() if keep_backup else None
+    f_cpu = faces.cpu() if keep_backup else None
+
+    v_gpu = verts.to(work_dev).float().contiguous() if verts.device != work_dev else verts.float().contiguous()
+    f_gpu = faces.to(work_dev).int().contiguous() if faces.device != work_dev else faces.int().contiguous()
+    # Release Mesh references BEFORE CuMesh.simplify() so vertices+faces aren't held twice on GPU (~2.7 GiB saved)
+    mesh_obj.vertices = None
+    mesh_obj.faces = None
+    del verts, faces
+    gc.collect()
+    if use_cuda:
+        torch_mod.cuda.empty_cache()
+
+    cm = cumesh_mod.CuMesh()
+    try:
+        cm.init(v_gpu, f_gpu)
+        del v_gpu, f_gpu
+        v_gpu = None
+        f_gpu = None
+        gc.collect()
+        if use_cuda:
+            torch_mod.cuda.empty_cache()
+        cm.simplify(target, verbose=verbose, options=opts)
+        out_v, out_f = cm.read()
+        del cm
+        cm = None
+        gc.collect()
+        if use_cuda:
+            torch_mod.cuda.empty_cache()
+        out_v, out_f = _compact_mesh_vertices(out_v, out_f, torch_mod)
+        mesh_obj.vertices = out_v.to(orig_dev) if out_v.device != orig_dev else out_v
+        mesh_obj.faces = out_f.to(orig_dev) if out_f.device != orig_dev else out_f
+        return
+    except Exception as exc:
+        if v_cpu is None and "v_gpu" in locals() and v_gpu is not None:
+            try:
+                v_cpu = v_gpu.cpu()
+                f_cpu = f_gpu.cpu()
+            except Exception:
+                pass
+        if exc.__traceback__ is not None:
+            traceback.clear_frames(exc.__traceback__)
+        cm = None
+        v_gpu = None
+        f_gpu = None
+        _clear_sticky_cuda_error(torch_mod)
+        gc.collect()
+        if use_cuda:
+            torch_mod.cuda.empty_cache()
+        if not _is_oom_like(exc) or v_cpu is None or f_cpu is None:
+            raise
+        log.warning(
+            "Single-shot CuMesh.simplify(%d) hit VRAM limit at %d faces; switching to seam-protected spatial slabs (%s)",
+            target,
+            f_count,
+            " ".join(s.strip() for s in str(exc).splitlines() if s.strip())[:160],
+        )
+
+    # Seam-protected spatial slab simplification on CPU-staged tensors, followed by global simplify pass.
+    assert v_cpu is not None and f_cpu is not None
+    num_slabs = max(2, min(8, (f_count + 44_999_999) // 45_000_000))
+    span = v_cpu.max(dim=0).values - v_cpu.min(dim=0).values
+    axis = int(span.argmax().item())
+    v_ax = v_cpu[:, axis]
+    sample_stride = max(1, f_count // 500_000)
+    f_sample = f_cpu[::sample_stride].long()
+    sample_c = (v_ax[f_sample[:, 0]] + v_ax[f_sample[:, 1]] + v_ax[f_sample[:, 2]]) * (1.0 / 3.0)
+    qs = torch_mod.linspace(0.0, 1.0, num_slabs + 1, dtype=sample_c.dtype)[1:-1]
+    cuts = torch_mod.quantile(sample_c, qs)
+    del f_sample, sample_c
+
+    face_slab = torch_mod.empty((f_count,), dtype=torch_mod.int16)
+    chunk_sz = 8_000_000
+    for s in range(0, f_count, chunk_sz):
+        e = min(s + chunk_sz, f_count)
+        f_sub = f_cpu[s:e].long()
+        c_sub = (v_ax[f_sub[:, 0]] + v_ax[f_sub[:, 1]] + v_ax[f_sub[:, 2]]) * (1.0 / 3.0)
+        face_slab[s:e].copy_(torch_mod.bucketize(c_sub, cuts).to(torch_mod.int16))
+    del cuts, v_ax
+
+    v_cnt_cpu = int(v_cpu.shape[0])
+    slab_count = torch_mod.zeros((v_cnt_cpu,), dtype=torch_mod.uint8)
+    for k in range(num_slabs):
+        v_in_k = torch_mod.zeros((v_cnt_cpu,), dtype=torch_mod.bool)
+        k_faces = f_cpu[face_slab == k]
+        for s in range(0, int(k_faces.shape[0]), chunk_sz):
+            e = min(s + chunk_sz, int(k_faces.shape[0]))
+            v_in_k[k_faces[s:e].reshape(-1).long()] = True
+        slab_count += v_in_k.to(torch_mod.uint8)
+        del k_faces, v_in_k
+    v_is_seam = slab_count > 1
+    del slab_count
+
+    is_seam_face = torch_mod.zeros((f_count,), dtype=torch_mod.bool)
+    for s in range(0, f_count, chunk_sz):
+        e = min(s + chunk_sz, f_count)
+        f_sub = f_cpu[s:e].long()
+        is_seam_face[s:e] = v_is_seam[f_sub[:, 0]] | v_is_seam[f_sub[:, 1]] | v_is_seam[f_sub[:, 2]]
+    del v_is_seam
+
+    seam_faces = f_cpu[is_seam_face]
+    seam_count = int(seam_faces.shape[0])
+    interior_budget = max(target // 2, int(target * 1.15) - seam_count)
+    interior_mask = ~is_seam_face
+    del is_seam_face
+    interior_total = max(1, int(interior_mask.sum().item()))
+
+    merged_verts: list[Any] = []
+    merged_faces: list[Any] = []
+    v_offset = 0
+    if seam_count > 0:
+        sv, sf = _compact_mesh_vertices(v_cpu, seam_faces, torch_mod)
+        merged_verts.append(sv)
+        merged_faces.append(sf + v_offset)
+        v_offset += int(sv.shape[0])
+    del seam_faces
+
+    for k in range(num_slabs):
+        slab_faces = f_cpu[interior_mask & (face_slab == k)]
+        k_cnt = int(slab_faces.shape[0])
+        if k_cnt == 0:
+            continue
+        k_target = max(1, int(round(interior_budget * (k_cnt / interior_total))))
+        vk, fk = _compact_mesh_vertices(v_cpu, slab_faces, torch_mod)
+        del slab_faces
+        vk_dev = vk.to(work_dev).contiguous()
+        fk_dev = fk.to(work_dev).contiguous()
+        del vk, fk
+        cm_k = cumesh_mod.CuMesh()
+        cm_k.init(vk_dev, fk_dev)
+        del vk_dev, fk_dev
+        gc.collect()
+        if use_cuda:
+            torch_mod.cuda.empty_cache()
+        cm_k.simplify(min(k_target, k_cnt), verbose=verbose, options=opts)
+        vk_out, fk_out = cm_k.read()
+        del cm_k
+        gc.collect()
+        if use_cuda:
+            torch_mod.cuda.empty_cache()
+        merged_verts.append(vk_out.cpu())
+        merged_faces.append(fk_out.cpu() + v_offset)
+        v_offset += int(vk_out.shape[0])
+        del vk_out, fk_out
+
+    del v_cpu, f_cpu, interior_mask, face_slab
+    all_v = torch_mod.cat(merged_verts, dim=0) if merged_verts else torch_mod.empty((0, 3), dtype=torch_mod.float32)
+    all_f = torch_mod.cat(merged_faces, dim=0) if merged_faces else torch_mod.empty((0, 3), dtype=torch_mod.int32)
+    del merged_verts, merged_faces
+
+    if int(all_f.shape[0]) > target:
+        all_v_dev = all_v.to(work_dev).contiguous()
+        all_f_dev = all_f.to(work_dev).contiguous()
+        del all_v, all_f
+        cm_final = cumesh_mod.CuMesh()
+        cm_final.init(all_v_dev, all_f_dev)
+        del all_v_dev, all_f_dev
+        gc.collect()
+        if use_cuda:
+            torch_mod.cuda.empty_cache()
+        cm_final.simplify(target, verbose=verbose, options=opts)
+        all_v, all_f = cm_final.read()
+        del cm_final
+        gc.collect()
+        if use_cuda:
+            torch_mod.cuda.empty_cache()
+        all_v, all_f = _compact_mesh_vertices(all_v, all_f, torch_mod)
+    mesh_obj.vertices = all_v.to(orig_dev) if all_v.device != orig_dev else all_v
+    mesh_obj.faces = all_f.to(orig_dev) if all_f.device != orig_dev else all_f
+
+
+def patch_mesh_simplify_noop(mesh_cls: Any, torch_mod: Any = None, cumesh_mod: Any = None) -> None:
+    """Skip redundant CuMesh build+readback when <= target and avoid duplicate GPU buffers on simplify."""
     if mesh_cls is None or _is_already_patched(mesh_cls, "_trellis2_simplify_patched"):
         return
     orig_simplify = mesh_cls.simplify
@@ -3129,13 +3332,22 @@ def patch_mesh_simplify_noop(mesh_cls: Any, torch_mod: Any = None) -> None:
         shape = getattr(faces, "shape", None)
         if shape is not None and len(shape) >= 1 and shape[0] <= target:
             return
-        verts = getattr(self, "vertices", None)
-        if torch_mod is not None and verts is not None and faces is not None:
-            try:
-                if getattr(verts, "is_cuda", False) and getattr(faces, "is_cuda", False):
-                    self.vertices, self.faces = _compact_mesh_vertices(verts, faces, torch_mod)
-            except Exception:
-                pass
+        if (
+            cumesh_mod is not None
+            and torch_mod is not None
+            and hasattr(cumesh_mod, "CuMesh")
+            and getattr(self, "vertices", None) is not None
+        ):
+            _simplify_mesh_oom_safe(
+                self,
+                target=int(target),
+                torch_mod=torch_mod,
+                cumesh_mod=cumesh_mod,
+                verbose=verbose,
+                options=options,
+            )
+            return
+        if torch_mod is not None:
             gc.collect()
             if hasattr(torch_mod, "cuda") and torch_mod.cuda.is_available():
                 torch_mod.cuda.empty_cache()
@@ -4286,32 +4498,6 @@ def warmup_pipeline_kernels(
     return warmed
 
 
-def _persist_flex_gemm_autotune_cache() -> None:
-    """Flush FlexGEMM's Triton autotune cache to persistent disk if exposed by installed version."""
-    import sys as _sys
-
-    fg = _sys.modules.get("flex_gemm")
-    if fg is None:
-        return
-    for attr_chain in (
-        ("utils", "autotuner", "save_autotune_cache"),
-        ("autotuner", "save_cache"),
-        ("autotune", "save_cache"),
-        ("ops", "autotuner", "save_cache"),
-    ):
-        obj: Any = fg
-        for part in attr_chain:
-            obj = getattr(obj, part, None)
-            if obj is None:
-                break
-        if callable(obj):
-            try:
-                obj()
-                return
-            except Exception:
-                pass
-
-
 class VRAMModelManager:
     """VRAM-budgeted LRU GPU residency + pinned-memory async CUDA stream prefetching."""
 
@@ -4805,7 +4991,11 @@ def install_trellis2_vram_optimizations(
         torch_mod,
     )
     patch_sparse_structure_cudagraph(SparseStructureFlowModel, torch_mod)
-    patch_mesh_simplify_noop(Mesh, torch_mod)
+    try:
+        import cumesh as _cumesh_top  # type: ignore[import-not-found]
+    except Exception:
+        _cumesh_top = None
+    patch_mesh_simplify_noop(Mesh, torch_mod, cumesh_mod=_cumesh_top)
     patch_cv2_inpaint_fastpath(cv2, np)
     try:
         import cumesh.remeshing as cumesh_remeshing_mod  # type: ignore[import-not-found]
@@ -5451,6 +5641,7 @@ class Trellis2Engine:
 
             m = meshes[0]
             del meshes
+            max_rast_faces = 16_777_216
             if (
                 getattr(getattr(m, "vertices", None), "is_cuda", False)
                 and getattr(getattr(m, "faces", None), "is_cuda", False)
@@ -5459,17 +5650,18 @@ class Trellis2Engine:
                 m.vertices, m.faces = _compact_mesh_vertices(m.vertices, m.faces, torch)
                 if int(m.vertices.shape[0]) < orig_v_cnt:
                     log.info(
-                        "Compacted mesh vertices before CuMesh fill_holes: %d -> %d (faces=%d)",
+                        "Compacted mesh vertices before CuMesh cleanup: %d -> %d (faces=%d)",
                         orig_v_cnt,
                         int(m.vertices.shape[0]),
                         int(m.faces.shape[0]),
                     )
 
+            is_oversized_mesh = int(getattr(getattr(m, "faces", None), "shape", (0,))[0]) > max_rast_faces
             tex_dec = pipe.models.get("tex_slat_decoder")
-            defer_tex_load = bool(tight_gpu or res > 1024)
+            defer_tex_load = bool(tight_gpu or res > 1024 or is_oversized_mesh)
             if mgr is not None:
                 if defer_tex_load:
-                    # Free ALL neural models & PyTorch cached blocks before raw-cudaMalloc CuMesh.fill_holes()
+                    # Free ALL neural models & PyTorch cached blocks before raw-cudaMalloc CuMesh calls
                     mgr.evict_except([], clear_cache=True)
                     gc.collect()
                     if torch.cuda.is_available():
@@ -5506,45 +5698,22 @@ class Trellis2Engine:
             faces_staged: Any = None
             spill_mesh_geom = False
 
-            def _run_fill_holes_resilient(mesh_obj: Any) -> None:
+            def _run_fill_holes_safe(mesh_obj: Any) -> None:
                 try:
                     mesh_obj.fill_holes()
                 except Exception as fh_exc:
                     if not _is_oom_like(fh_exc):
                         raise
+                    if fh_exc.__traceback__ is not None:
+                        traceback.clear_frames(fh_exc.__traceback__)
                     _clear_sticky_cuda_error(torch)
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    f_cnt = int(getattr(getattr(mesh_obj, "faces", None), "shape", (0,))[0])
-                    if f_cnt > 16_777_216:
-                        log.warning(
-                            "CuMesh.fill_holes OOM at %d faces; simplifying to 16,777,216 cap first (%s)",
-                            f_cnt,
-                            fh_exc,
-                        )
-                        mesh_obj.simplify(16_777_216)
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        try:
-                            mesh_obj.fill_holes()
-                        except Exception as fh_exc2:
-                            if not _is_oom_like(fh_exc2):
-                                raise
-                            _clear_sticky_cuda_error(torch)
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            log.warning(
-                                "Deferring CuMesh.fill_holes to postprocess.to_glb after post-simplify OOM (%s)",
-                                fh_exc2,
-                            )
-                    else:
-                        log.warning(
-                            "Deferring CuMesh.fill_holes to postprocess.to_glb after VRAM OOM (%s)",
-                            fh_exc,
-                        )
+                    log.warning(
+                        "Deferring CuMesh.fill_holes to postprocess.to_glb after VRAM OOM (%s)",
+                        fh_exc,
+                    )
 
             if can_overlap_fill:
                 shape_done_evt = torch.cuda.Event()
@@ -5564,7 +5733,19 @@ class Trellis2Engine:
                 )
                 fill_thread.start()
             else:
-                _run_fill_holes_resilient(m)
+                if is_oversized_mesh:
+                    # Skip OOM-prone fill_holes on >16.77M-face raw dual-grid meshes; simplify to the
+                    # nvdiffrast cap first so fill_holes runs fast on <=16.77M faces with ~20+ GiB free.
+                    log.info(
+                        "Simplifying oversized raw mesh (%d > %d faces) before CuMesh.fill_holes",
+                        int(m.faces.shape[0]),
+                        max_rast_faces,
+                    )
+                    m.simplify(max_rast_faces)
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                _run_fill_holes_safe(m)
                 free_after_shape = _cuda_free_gb(torch)
                 spill_mesh_geom = bool(
                     mgr is None
@@ -5785,7 +5966,7 @@ class Trellis2Engine:
                     local_tmp.unlink(missing_ok=True)
                     if staging_tmp is not None:
                         staging_tmp.unlink(missing_ok=True)
-                _persist_flex_gemm_autotune_cache()
+                _flush_flex_gemm_autotune_cache()
                 succeeded = True
                 return out_path
         finally:
