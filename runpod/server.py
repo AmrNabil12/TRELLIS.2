@@ -216,10 +216,6 @@ DEFAULT_TOKEN_CHUNK_SIZE = max(4_096, int(os.environ.get("TRELLIS2_TOKEN_CHUNK",
 FAST_TOKEN_CHUNK_HIGH = 262_144
 DEFAULT_MAX_NUM_TOKENS = max(16_384, int(os.environ.get("TRELLIS2_MAX_NUM_TOKENS", "81920")))
 BATCH_CFG_MAX_SPARSE_TOKENS = max(4_096, int(os.environ.get("TRELLIS2_BATCH_CFG_MAX_TOKENS", "24576")))
-OOM_FALLBACK_CHAIN: dict[str, str] = {
-    "1536_cascade": "1024_cascade",
-    "1024_cascade": "1024",
-}
 
 
 class GenerationParams(BaseModel):
@@ -393,8 +389,6 @@ def _effective_voxel_chunk(torch_mod: Any, base_chunk: int) -> int:
     """Scale voxel chunk size up to 2M rows above the 4 GiB safety floor to maximize Tensor Core occupancy."""
     if base_chunk != DEFAULT_VOXEL_CHUNK_SIZE or "TRELLIS2_VOXEL_CHUNK" in os.environ:
         return base_chunk
-    if os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0":
-        return base_chunk
     free_gb = _cuda_free_gb(torch_mod)
     if free_gb is None:
         return base_chunk
@@ -410,8 +404,6 @@ def _effective_voxel_chunk(torch_mod: Any, base_chunk: int) -> int:
 def _effective_token_chunk(torch_mod: Any, base_chunk: int) -> int:
     """Run DiT SparseFeedForwardNet in a single unchunked cuBLAS GEMM (up to 262K tokens) above 4 GiB reserve."""
     if base_chunk != DEFAULT_TOKEN_CHUNK_SIZE or "TRELLIS2_TOKEN_CHUNK" in os.environ:
-        return base_chunk
-    if os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0":
         return base_chunk
     free_gb = _cuda_free_gb(torch_mod)
     if free_gb is not None and free_gb >= VRAM_SAFETY_FLOOR_GB + 0.5:
@@ -456,30 +448,6 @@ def patch_layernorm32(
 
     layernorm_cls.forward = _chunked_ln_forward
     layernorm_cls._trellis2_vram_patched = True
-
-
-def _make_compiled_pointwise(fn: Callable[..., Any], torch_mod: Any) -> Callable[..., Any]:
-    """Compile a pointwise CUDA kernel when explicitly opted in (TRELLIS2_COMPILE_POINTWISE=1).
-
-    Disabled by default on serverless workers because compiling multiple SparseConvNeXt channel
-    widths (1024/512/256/128) on 6 vCPUs adds ~55s of cold Inductor overhead inside upsample_coords,
-    whereas eager cuBLAS GEMMs + inplace SiLU already saturate Tensor Cores with 0s compile latency.
-    """
-    if (
-        torch_mod is None
-        or os.name == "nt"
-        or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
-        or os.environ.get("TRELLIS2_TORCH_COMPILE", "1") == "0"
-        or os.environ.get("TRELLIS2_COMPILE_POINTWISE", "0") != "1"
-        or not callable(getattr(torch_mod, "compile", None))
-        or not torch_mod.cuda.is_available()
-    ):
-        return fn
-    try:
-        return torch_mod.compile(fn, mode="default", dynamic=True)
-    except Exception as exc:
-        log.debug("torch.compile unavailable for %s; using eager mode: %s", fn.__name__, exc)
-        return fn
 
 
 def _is_cuda_oom_msg(exc: BaseException) -> bool:
@@ -913,30 +881,6 @@ def _chunked_subm_conv3d_slices_to_cpu(
     return staged_slices
 
 
-def _chunked_subm_conv3d_to_cpu(
-    conv_mod: Any,
-    x: Any,
-    torch_mod: Any,
-    max_slice_bytes: int | None = None,
-) -> Any | None:
-    """Return a single ``(N, Co)`` CPU tensor from ``_chunked_subm_conv3d_slices_to_cpu``."""
-    slices = _chunked_subm_conv3d_slices_to_cpu(conv_mod, x, torch_mod, max_slice_bytes=max_slice_bytes)
-    if slices is None:
-        return None
-    try:
-        cpu_parts = []
-        for _c0, _c1, sl in slices:
-            if isinstance(sl, _DiskMmapTensor):
-                cpu_parts.append(sl.tensor.clone())
-            elif hasattr(sl, "cpu"):
-                cpu_parts.append(sl.cpu())
-            else:
-                cpu_parts.append(sl)
-        return cpu_parts[0] if len(cpu_parts) == 1 else torch_mod.cat(cpu_parts, dim=1)
-    finally:
-        _release_staged_slices(slices)
-
-
 def _copy_cpu_slices_into_gpu_feats(
     feats: Any,
     cpu_slices: list[tuple[int, int, Any]],
@@ -983,20 +927,6 @@ def patch_sparse_convnext_block(
     """
     if _is_already_patched(convnext_cls, "_trellis2_vram_patched"):
         return
-
-    def _convnext_pointwise_eager(
-        sub_h: Any, sub_x: Any, ln_w: Any, ln_b: Any, ln_eps: float, w1: Any, b1: Any, w2: Any, b2: Any
-    ) -> Any:
-        ln_w_f = ln_w.float() if ln_w is not None else None
-        ln_b_f = ln_b.float() if ln_b is not None else None
-        y = f_mod.layer_norm(sub_h.float(), (sub_h.shape[-1],), ln_w_f, ln_b_f, ln_eps).to(sub_h.dtype)
-        y = f_mod.linear(y, w1, b1)
-        y = f_mod.silu(y)
-        y = f_mod.linear(y, w2, b2)
-        return y + sub_x
-
-    compiled_pointwise = _make_compiled_pointwise(_convnext_pointwise_eager, torch_mod)
-    compile_state = {"failed": False}
 
     def _chunked_convnext_forward(self: Any, x: Any) -> Any:
         x_feats = x.feats
@@ -1078,31 +1008,6 @@ def patch_sparse_convnext_block(
             return x
 
         feats = h.feats
-        use_fused = (
-            not compile_state["failed"]
-            and compiled_pointwise is not _convnext_pointwise_eager
-            and is_cuda
-            and hasattr(self.norm, "eps")
-            and hasattr(self.mlp[0], "weight")
-            and hasattr(self.mlp[2], "weight")
-        )
-        if use_fused:
-            ln_w = getattr(self.norm, "weight", None)
-            ln_b = getattr(self.norm, "bias", None)
-            ln_eps = float(getattr(self.norm, "eps", 1e-6))
-            w1, b1 = self.mlp[0].weight, self.mlp[0].bias
-            w2, b2 = self.mlp[2].weight, self.mlp[2].bias
-            try:
-                for s in range(0, n, step):
-                    e = min(s + step, n)
-                    feats[s:e].copy_(
-                        compiled_pointwise(feats[s:e], x_feats[s:e], ln_w, ln_b, ln_eps, w1, b1, w2, b2)
-                    )
-                return h
-            except Exception as exc:
-                log.debug("ConvNeXt compiled kernel failed; falling back to eager: %s", exc)
-                compile_state["failed"] = True
-
         for s in range(0, n, step):
             e = min(s + step, n)
             sub = self.norm(feats[s:e])
@@ -1528,8 +1433,7 @@ def patch_sparse_c2s_block(
         is_cuda_x = bool(getattr(x.feats, "is_cuda", False))
         free_gb = _cuda_free_gb(torch_mod) if is_cuda_x else None
         keep_sub_on_gpu = bool(
-            os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
-            and is_cuda_x
+            is_cuda_x
             and n_in < 1_000_000
             and (free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 6.0)
         )
@@ -1640,7 +1544,6 @@ def patch_sparse_c2s_block(
                     self.pred_subdiv
                     and sub_ret is not None
                     and (not is_cuda_x or keep_sub_on_gpu)
-                    and os.environ.get("TRELLIS2_CROSS_DECODER_CACHE", "1") != "0"
                 ):
                     sub_ret._c2s_gather_cache = (new_coords, flat_idx)
 
@@ -1872,11 +1775,7 @@ def patch_sparse_unet_decoder(
         dev = x.device
         is_cuda_x = str(dev).startswith("cuda")
         stream = bool(getattr(self, "low_vram", False) or getattr(self, "_stream_active_blocks", False))
-        share_cross_cache = bool(
-            not stream
-            and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
-            and os.environ.get("TRELLIS2_CROSS_DECODER_CACHE", "1") != "0"
-        )
+        share_cross_cache = not stream
 
         cross_caches: dict[int, dict[str, Any]] | None = None
         if guide_subs and len(guide_subs) > 0:
@@ -2313,51 +2212,19 @@ def patch_sparse_ffn(
         return
     orig_forward = ffn_cls.forward
 
-    def _ffn_tanh_eager(sub_x: Any, w1: Any, b1: Any, w2: Any, b2: Any) -> Any:
-        return f_mod.linear(f_mod.gelu(f_mod.linear(sub_x, w1, b1), approximate="tanh"), w2, b2)
-
-    def _ffn_none_eager(sub_x: Any, w1: Any, b1: Any, w2: Any, b2: Any) -> Any:
-        return f_mod.linear(f_mod.gelu(f_mod.linear(sub_x, w1, b1), approximate="none"), w2, b2)
-
-    compiled_ffn_tanh = _make_compiled_pointwise(_ffn_tanh_eager, torch_mod)
-    compiled_ffn_none = _make_compiled_pointwise(_ffn_none_eager, torch_mod)
-    compile_state = {"failed": False}
-
     def _chunked_ffn_forward(self: Any, x: Any) -> Any:
         if getattr(self, "training", False):
             return orig_forward(self, x)
         n = x.feats.shape[0]
         step = _effective_token_chunk(torch_mod, chunk_size)
-        fc1, act, fc2 = self.mlp[0], self.mlp[1], self.mlp[2]
-        approx = getattr(act, "approximate", "tanh")
-        compiled_fn = compiled_ffn_tanh if approx == "tanh" else compiled_ffn_none
-        eager_ref = _ffn_tanh_eager if approx == "tanh" else _ffn_none_eager
-        use_compiled = (
-            not compile_state["failed"]
-            and compiled_fn is not eager_ref
-            and bool(getattr(x.feats, "is_cuda", False))
-            and hasattr(fc1, "weight")
-            and hasattr(fc2, "weight")
-        )
         if n <= step:
-            if use_compiled:
-                try:
-                    return x.replace(compiled_fn(x.feats, fc1.weight, fc1.bias, fc2.weight, fc2.bias))
-                except Exception as exc:
-                    log.debug("SparseFFN compiled kernel failed; falling back to eager: %s", exc)
-                    compile_state["failed"] = True
             return orig_forward(self, x)
 
+        fc1, act, fc2 = self.mlp[0], self.mlp[1], self.mlp[2]
+        approx = getattr(act, "approximate", "tanh")
         out = torch_mod.empty_like(x.feats)
         for s in range(0, n, step):
             e = min(s + step, n)
-            if use_compiled and not compile_state["failed"]:
-                try:
-                    out[s:e].copy_(compiled_fn(x.feats[s:e], fc1.weight, fc1.bias, fc2.weight, fc2.bias))
-                    continue
-                except Exception as exc:
-                    log.debug("SparseFFN chunked compiled kernel failed; falling back to eager: %s", exc)
-                    compile_state["failed"] = True
             sub = f_mod.linear(x.feats[s:e], fc1.weight, fc1.bias)
             sub = f_mod.gelu(sub, approximate=approx)
             sub = f_mod.linear(sub, fc2.weight, fc2.bias)
@@ -2509,7 +2376,6 @@ def patch_cross_attention_kv_cache(
                 and (getattr(self, "qk_rms_norm", False) or getattr(self, "use_rope", False))
                 and not getattr(self, "training", False)
                 and s_attn is not None
-                and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
             ):
                 # Avoid repacking [q, k, v] via torch.stack (~400-471 MB per block x 30 blocks x 21 passes)
                 # by invoking flash_attn_varlen_func(q, k, v) directly (bit-identical FlashAttention-2 math).
@@ -2896,18 +2762,8 @@ def patch_cfg_sampler_batching(
             noise_dev = getattr(noise, "device", None)
             is_cuda_run = noise_dev is not None and str(noise_dev).startswith("cuda")
             free_gb = _cuda_free_gb(torch_mod) if is_cuda_run else None
-            fast_vram = os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
-            use_kv_cache = (
-                fast_vram
-                and os.environ.get("TRELLIS2_KV_CACHE", "1") != "0"
-                and (free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 0.3)
-            )
-            use_batch_cfg = (
-                fast_vram
-                and os.environ.get("TRELLIS2_BATCH_CFG", "1") != "0"
-                and not getattr(model, "_stream_active_blocks", False)
-                and (free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 0.8)
-            )
+            use_kv_cache = free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 0.3
+            use_batch_cfg = free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 0.8
 
             model_dtype = getattr(model, "dtype", None)
             autocast_on = bool(
@@ -2996,8 +2852,6 @@ def patch_sparse_structure_cudagraph(ss_flow_cls: Any, torch_mod: Any) -> None:
         if (
             getattr(self, "training", False)
             or getattr(self, "_cudagraph_disabled", False)
-            or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
-            or os.environ.get("TRELLIS2_CUDAGRAPH", "1") == "0"
             or not getattr(x, "is_cuda", False)
             or not getattr(t, "is_cuda", False)
             or not getattr(cond, "is_cuda", False)
@@ -4452,8 +4306,7 @@ def patch_cumesh_remeshing(remeshing_mod: Any, torch_mod: Any = None) -> None:
     """Patch cumesh.remeshing.remesh_narrow_band_dc to eliminate >12 GiB of temporary VRAM spikes."""
     if remeshing_mod is None or getattr(remeshing_mod, "_trellis2_remesh_patched", False):
         return
-    orig_remesh = getattr(remeshing_mod, "remesh_narrow_band_dc", None)
-    if not callable(orig_remesh):
+    if not callable(getattr(remeshing_mod, "remesh_narrow_band_dc", None)):
         return
     t_mod = torch_mod if torch_mod is not None else getattr(remeshing_mod, "torch", None)
     if t_mod is None:
@@ -4470,18 +4323,6 @@ def patch_cumesh_remeshing(remeshing_mod: Any, torch_mod: Any = None) -> None:
         verbose: bool = False,
         bvh: Any = None,
     ) -> tuple[Any, Any]:
-        if os.environ.get("TRELLIS2_CHUNKED_REMESH", "1") == "0":
-            return orig_remesh(
-                vertices,
-                faces,
-                center=center,
-                scale=scale,
-                resolution=resolution,
-                band=band,
-                project_back=project_back,
-                verbose=verbose,
-                bvh=bvh,
-            )
         return _chunked_remesh_narrow_band_dc(
             vertices,
             faces,
@@ -4522,12 +4363,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
         base_color: Any, metallic: Any, roughness: Any, alpha: Any, mask_inv: Any
     ) -> tuple[Any, Any, Any, Any]:
         t_local = torch_mod if torch_mod is not None else getattr(postprocess_mod, "torch", None)
-        if (
-            t_local is not None
-            and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
-            and os.environ.get("TRELLIS2_GPU_UV_DILATE", "1") != "0"
-            and t_local.cuda.is_available()
-        ):
+        if t_local is not None and t_local.cuda.is_available():
             try:
                 import torch.nn.functional as f_mod
 
@@ -4605,9 +4441,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 if use_cuda:
                     t_mod.cuda.empty_cache()
 
-            stage_vol_cpu = bool(
-                use_cuda and os.environ.get("TRELLIS2_STAGE_BAKE_VOLUME_CPU", "1") != "0"
-            )
+            stage_vol_cpu = use_cuda
             attr_vol_staged = attr_volume.cpu() if (stage_vol_cpu and hasattr(attr_volume, "cpu")) else attr_volume
             coords_staged = coords.cpu() if (stage_vol_cpu and hasattr(coords, "cpu")) else coords
             attr_channels = int(attr_vol_staged.shape[1])
@@ -4720,92 +4554,82 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             else:
                 center = aabb.mean(dim=0)
                 scale = float((aabb[1] - aabb[0]).max().item())
-                full_res = int(grid_size.max().item())
-                dc_candidates = [full_res]
-                if full_res > 1024 and os.environ.get("TRELLIS2_DC_OOM_FALLBACK", "1") != "0":
-                    dc_candidates.append(1024)
-
-                for idx_cand, dc_res in enumerate(dc_candidates):
+                dc_res = int(grid_size.max().item())
+                dc_verts = None
+                dc_faces = None
+                try:
+                    _flush_allocator_for_cpp()
+                    dc_verts, dc_faces = cumesh_local.remeshing.remesh_narrow_band_dc(
+                        vertices,
+                        faces,
+                        center=center,
+                        scale=(dc_res + 3 * remesh_band) / dc_res * scale,
+                        resolution=dc_res,
+                        band=remesh_band,
+                        project_back=remesh_project,
+                        verbose=verbose,
+                        bvh=bvh,
+                    )
+                    dc_f_cnt = int(dc_faces.shape[0])
+                    if stage_vol_cpu and vertices is not None:
+                        orig_verts_cpu = vertices.cpu()
+                        orig_faces_cpu = faces.cpu()
+                        vertices = None
+                        faces = None
+                    mesh = cumesh_local.CuMesh()
+                    mesh.init(dc_verts, dc_faces)
+                    del dc_verts, dc_faces
                     dc_verts = None
                     dc_faces = None
-                    try:
-                        if vertices is None:
-                            vertices = _to_dev(orig_verts_cpu)
-                            faces = _to_dev(orig_faces_cpu)
-                        if bvh is None:
-                            bvh = cumesh_local.cuBVH(vertices, faces)
-                        _flush_allocator_for_cpp()
-                        dc_verts, dc_faces = cumesh_local.remeshing.remesh_narrow_band_dc(
-                            vertices,
-                            faces,
-                            center=center,
-                            scale=(dc_res + 3 * remesh_band) / dc_res * scale,
-                            resolution=dc_res,
-                            band=remesh_band,
-                            project_back=remesh_project,
-                            verbose=verbose,
-                            bvh=bvh,
-                        )
-                        dc_f_cnt = int(dc_faces.shape[0])
-                        if stage_vol_cpu and vertices is not None:
+                    # Release cuBVH before high-face single-shot CuMesh.simplify when VRAM is tight;
+                    # Stage 5 rebuilds cuBVH cleanly from orig_verts_cpu after uv_unwrap frees mesh.
+                    if bvh is not None and dc_f_cnt > 25_000_000 and use_cuda:
+                        if vertices is not None:
                             orig_verts_cpu = vertices.cpu()
                             orig_faces_cpu = faces.cpu()
                             vertices = None
                             faces = None
-                        mesh = cumesh_local.CuMesh()
-                        mesh.init(dc_verts, dc_faces)
-                        del dc_verts, dc_faces
-                        dc_verts = None
-                        dc_faces = None
-                        # Release cuBVH before high-face single-shot CuMesh.simplify when VRAM is tight;
-                        # Stage 5 rebuilds cuBVH cleanly from orig_verts_cpu after uv_unwrap frees mesh.
-                        if bvh is not None and dc_f_cnt > 25_000_000 and use_cuda:
-                            if vertices is not None:
-                                orig_verts_cpu = vertices.cpu()
-                                orig_faces_cpu = faces.cpu()
-                                vertices = None
-                                faces = None
-                            free_pre_simp = _cuda_free_gb(t_mod)
-                            if free_pre_simp is None or (free_pre_simp * (1024**3)) < (dc_f_cnt * 220 * 1.15):
-                                del bvh
-                                bvh = None
-                        # Release all PyTorch cached segments BEFORE CuMesh C++ simplify calls raw cudaMalloc()
-                        _flush_allocator_for_cpp()
-                        if verbose:
-                            print(f"After remeshing: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-                        mesh.simplify(decimation_target, verbose=verbose)
-                        if verbose:
-                            print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-                        # Clean non-manifold pinches/duplicate/sliver faces created during high-ratio DC simplify
-                        # before uv_unwrap so xatlas charts do not fragment across non-manifold edges.
-                        if hasattr(mesh, "remove_degenerate_faces"):
-                            mesh.remove_degenerate_faces()
-                        if hasattr(mesh, "remove_duplicate_faces"):
-                            mesh.remove_duplicate_faces()
-                        if hasattr(mesh, "remove_small_connected_components"):
-                            mesh.remove_small_connected_components(1e-5)
-                        if hasattr(mesh, "repair_non_manifold_edges"):
-                            mesh.repair_non_manifold_edges()
-                        break
-                    except Exception as remesh_exc:
-                        if remesh_exc.__traceback__ is not None:
-                            traceback.clear_frames(remesh_exc.__traceback__)
-                        mesh = None
-                        del dc_verts, dc_faces
-                        _clear_sticky_cuda_error(t_mod)
-                        _flush_allocator_for_cpp()
-                        if idx_cand + 1 < len(dc_candidates) and _is_oom_like(remesh_exc):
-                            next_dc = dc_candidates[idx_cand + 1]
-                            log.warning(
-                                "CuMesh remesh/simplify hit VRAM limit at dc_resolution=%d (%s); "
-                                "retrying DC cage at %d while preserving %d^3 BVH & PBR volume.",
-                                dc_res,
-                                " ".join(s.strip() for s in str(remesh_exc).splitlines() if s.strip())[:200],
-                                next_dc,
-                                full_res,
-                            )
-                            continue
-                        raise
+                        free_pre_simp = _cuda_free_gb(t_mod)
+                        if free_pre_simp is None or (free_pre_simp * (1024**3)) < (dc_f_cnt * 220 * 1.15):
+                            del bvh
+                            bvh = None
+                    # Release all PyTorch cached segments BEFORE CuMesh C++ simplify calls raw cudaMalloc()
+                    _flush_allocator_for_cpp()
+                    if verbose:
+                        print(f"After remeshing: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                    mesh.simplify(decimation_target, verbose=verbose)
+                    if verbose:
+                        print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+                    # Clean non-manifold pinches/duplicate/sliver faces created during high-ratio DC simplify
+                    # before uv_unwrap so xatlas charts do not fragment across non-manifold edges.
+                    if hasattr(mesh, "remove_degenerate_faces"):
+                        mesh.remove_degenerate_faces()
+                    if hasattr(mesh, "remove_duplicate_faces"):
+                        mesh.remove_duplicate_faces()
+                    if hasattr(mesh, "repair_non_manifold_edges"):
+                        mesh.repair_non_manifold_edges()
+                    if hasattr(mesh, "remove_small_connected_components"):
+                        mesh.remove_small_connected_components(1e-5)
+                    if hasattr(mesh, "fill_holes"):
+                        try:
+                            mesh.fill_holes(max_hole_perimeter=5e-2)
+                        except Exception as fh_exc:
+                            if _is_cuda_oom_msg(fh_exc):
+                                _flush_allocator_for_cpp()
+                                log.warning("Skipping CuMesh.fill_holes after simplify due to VRAM OOM (%s)", fh_exc)
+                            else:
+                                raise
+                        else:
+                            if hasattr(mesh, "remove_degenerate_faces"):
+                                mesh.remove_degenerate_faces()
+                except Exception as remesh_exc:
+                    if remesh_exc.__traceback__ is not None:
+                        traceback.clear_frames(remesh_exc.__traceback__)
+                    mesh = None
+                    del dc_verts, dc_faces
+                    _clear_sticky_cuda_error(t_mod)
+                    _flush_allocator_for_cpp()
+                    raise
 
             if pbar is not None:
                 pbar.update(1)
@@ -5056,8 +4880,6 @@ class _FastLosslessPngContext:
 
     def __enter__(self) -> None:
         self._orig_save = None
-        if os.environ.get("TRELLIS2_FAST_PNG", "1") == "0":
-            return
         self._lock.acquire()
         self._orig_save = Image.Image.save
         orig = self._orig_save
@@ -5125,58 +4947,6 @@ def patch_cv2_inpaint_fastpath(cv2_mod: Any, np_mod: Any) -> None:
     cv2_mod._trellis2_inpaint_patched = True
 
 
-def patch_torch_compile_modules(pipeline: Any, torch_mod: Any) -> list[str]:
-    """Optionally apply persistent torch.compile to dense backbone modules when TRELLIS2_COMPILE_BACKBONES=1.
-
-    By default (TRELLIS2_COMPILE_BACKBONES=0), whole-backbone compilation is skipped because:
-    - BiRefNet (rembg_model.model) has dynamic Swin/deformable control flow that stalls TorchInductor
-      for 7+ minutes while running in ~0.25s eagerly (never compiled even when opted in).
-    - DINOv3 (image_cond_model) and sparse_structure_decoder run <0.5s total eagerly while adding
-      ~55s+ to worker cold-boot and recompiling at 1024px.
-    Hot-loop pointwise Triton kernels (SparseConvNeXtBlock3d MLP & SparseFeedForwardNet MLP) remain
-    compiled separately via _make_compiled_pointwise under TRELLIS2_TORCH_COMPILE=1.
-    """
-    compiled: list[str] = []
-    if (
-        pipeline is None
-        or torch_mod is None
-        or os.name == "nt"
-        or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
-        or os.environ.get("TRELLIS2_TORCH_COMPILE", "1") == "0"
-        or os.environ.get("TRELLIS2_COMPILE_BACKBONES", "0") != "1"
-        or not callable(getattr(torch_mod, "compile", None))
-        or not torch_mod.cuda.is_available()
-    ):
-        return compiled
-
-    models_dict = getattr(pipeline, "models", None)
-    if isinstance(models_dict, dict):
-        ss_dec = models_dict.get("sparse_structure_decoder")
-        if ss_dec is not None and not getattr(ss_dec, "_trellis2_compiled", False):
-            try:
-                compiled_dec = torch_mod.compile(ss_dec, mode="default", dynamic=True)
-                compiled_dec._trellis2_compiled = True
-                models_dict["sparse_structure_decoder"] = compiled_dec
-                compiled.append("sparse_structure_decoder")
-            except Exception as exc:
-                log.debug("Skipping torch.compile for sparse_structure_decoder: %s", exc)
-
-    img_cond = getattr(pipeline, "image_cond_model", None)
-    if img_cond is not None and not getattr(img_cond, "_trellis2_compiled", False):
-        extract_fn = getattr(img_cond, "extract_features", None)
-        if callable(extract_fn):
-            try:
-                img_cond.extract_features = torch_mod.compile(extract_fn, mode="default", dynamic=True)
-                img_cond._trellis2_compiled = True
-                compiled.append("image_cond_model.extract_features")
-            except Exception as exc:
-                log.debug("Skipping torch.compile for image_cond_model.extract_features: %s", exc)
-
-    if compiled:
-        log.info("Enabled persistent torch.compile (Inductor) for: %s", ", ".join(compiled))
-    return compiled
-
-
 def warmup_pipeline_kernels(
     pipeline: Any,
     torch_mod: Any,
@@ -5187,8 +4957,6 @@ def warmup_pipeline_kernels(
     if (
         pipeline is None
         or torch_mod is None
-        or os.environ.get("TRELLIS2_FAST_VRAM", "1") == "0"
-        or os.environ.get("TRELLIS2_BOOT_WARMUP", "1") == "0"
         or not torch_mod.cuda.is_available()
     ):
         return warmed
@@ -5297,37 +5065,23 @@ def warmup_pipeline_kernels(
 
 
 class VRAMModelManager:
-    """VRAM-budgeted LRU GPU residency + pinned-memory async CUDA stream prefetching."""
+    """VRAM-budgeted LRU GPU residency + async CUDA stream prefetching."""
 
     def __init__(
         self,
         pipeline: Any,
         torch_mod: Any,
         vram_gb: float | None = None,
-        enable_pin_memory: bool = True,
     ) -> None:
         self._pipeline = pipeline
         self._torch = torch_mod
         self._vram_gb = vram_gb
         host_lim_gb, host_avail_gb = _host_ram_stats_gb()
-        pin_mode = os.environ.get("TRELLIS2_PIN_MEMORY", "0").strip().lower()
-        # Pinning 15+ GiB of offloaded DiT weights in PyTorch's CachingHostAllocator permanently locks
-        # unswappable pages and triggers container OOM kills (exit 137) even when bare-metal /proc/meminfo
-        # reports >64 GiB. Keep disabled by default unless explicitly opted in via TRELLIS2_PIN_MEMORY=1.
-        want_pin = pin_mode in {"1", "true", "yes", "on"}
-        self._pin_enabled = bool(
-            enable_pin_memory
-            and os.name != "nt"
-            and want_pin
-            and torch_mod is not None
-            and torch_mod.cuda.is_available()
-        )
         if host_lim_gb is not None or host_avail_gb is not None:
             log.info(
-                "Detected Host/cgroup RAM: limit=%s GiB, available=%s GiB (pin_memory=%s)",
+                "Detected Host/cgroup RAM: limit=%s GiB, available=%s GiB",
                 f"{host_lim_gb:.2f}" if host_lim_gb is not None else "unlimited",
                 f"{host_avail_gb:.2f}" if host_avail_gb is not None else "unknown",
-                self._pin_enabled,
             )
         self._models: dict[str, Any] = {}
         for name, mod in (getattr(pipeline, "models", {}) or {}).items():
@@ -5342,7 +5096,6 @@ class VRAMModelManager:
             name: self._estimate_size_gb(mod) for name, mod in self._models.items()
         }
         self._resident_lru: dict[str, int] = {}
-        self._pinned: set[str] = set()
         self._tick = 0
         self._prefetch_stream: Any = None
         self._inflight_events: dict[str, Any] = {}
@@ -5376,24 +5129,6 @@ class VRAMModelManager:
                 except Exception:
                     pass
         return max(0.05, total / (1024**3)) if total > 0 else 0.5
-
-    def _pin_on_cpu(self, name: str) -> None:
-        if not self._pin_enabled or name in self._pinned:
-            return
-        mod = self._unwrap_module(self._models.get(name))
-        if mod is None or not hasattr(mod, "parameters"):
-            return
-        try:
-            for p in mod.parameters():
-                if not p.is_cuda and not p.is_pinned():
-                    p.data = p.data.pin_memory()
-            for b in mod.buffers():
-                if not b.is_cuda and not b.is_pinned():
-                    b.data = b.data.pin_memory()
-            self._pinned.add(name)
-        except Exception:
-            # Respect container memlock ulimits cleanly without failing
-            self._pin_enabled = False
 
     def _move_to_device(self, name: str, device: Any, non_blocking: bool = False) -> None:
         obj = self._models.get(name)
@@ -5435,15 +5170,11 @@ class VRAMModelManager:
             if inner is not obj and callable(getattr(inner, "cpu", None)):
                 inner.cpu()
         self._resident_lru.pop(name, None)
-        self._pin_on_cpu(name)
 
     def warm_initial_models(self, device: Any) -> None:
         """Pre-stage all active cascade models into VRAM up to the 4 GiB safety floor + diffusion buffer."""
         if self._torch is None or not self._torch.cuda.is_available():
             return
-        # Pin unused 512 texture flow model on CPU so cascade runs never pay for it
-        if "tex_slat_flow_model_512" in self._models:
-            self._pin_on_cpu("tex_slat_flow_model_512")
 
         priority = (
             "rembg_model",
@@ -5465,15 +5196,10 @@ class VRAMModelManager:
             free_gb = _cuda_free_gb(self._torch)
             need_gb = self._sizes_gb.get(name, 1.0)
             if free_gb is not None and (free_gb - need_gb) < reserve_gb:
-                self._pin_on_cpu(name)
                 continue
             self._move_to_device(name, device, non_blocking=False)
             self._tick += 1
             self._resident_lru[name] = self._tick
-
-        for name in self._models:
-            if name not in self._resident_lru:
-                self._pin_on_cpu(name)
 
     def ensure_on_gpu(
         self,
@@ -5523,7 +5249,7 @@ class VRAMModelManager:
 
         for n in present_names:
             if n not in self._resident_lru:
-                self._move_to_device(n, device, non_blocking=bool( n in self._pinned ))
+                self._move_to_device(n, device, non_blocking=False)
             self._tick += 1
             self._resident_lru[n] = self._tick
 
@@ -5548,7 +5274,6 @@ class VRAMModelManager:
             if (free_gb - need_gb) < min_free_after_gb:
                 continue
             free_gb -= need_gb
-            self._pin_on_cpu(n)
             try:
                 cur_stream = self._torch.cuda.current_stream()
                 self._prefetch_stream.wait_stream(cur_stream)
@@ -5597,71 +5322,6 @@ class VRAMModelManager:
             except Exception:
                 pass
         self._resident_lru.clear()
-
-
-def patch_dit_block_streaming(slat_flow_cls: Any) -> None:
-    """Optional Active-Parameter Block Streaming for 1.3B DiT SLatFlowModel (1 block on GPU at a time)."""
-    if _is_already_patched(slat_flow_cls, "_trellis2_dit_stream_patched"):
-        return
-    orig_to = slat_flow_cls.to
-    orig_forward = slat_flow_cls.forward
-
-    def _dit_to(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if getattr(self, "_stream_active_blocks", False) and not getattr(self, "training", False):
-            target_dev = args[0] if args else kwargs.get("device")
-            if target_dev is not None and str(target_dev).startswith("cuda"):
-                # Move lightweight stem/head layers, keep heavy 30-block torso on CPU
-                self.t_embedder.to(target_dev)
-                if getattr(self, "share_mod", False):
-                    self.adaLN_modulation.to(target_dev)
-                if hasattr(self, "pos_embedder"):
-                    self.pos_embedder.to(target_dev)
-                self.input_layer.to(target_dev)
-                self.out_layer.to(target_dev)
-                return self
-        return orig_to(self, *args, **kwargs)
-
-    def _dit_forward(self: Any, x: Any, t: Any, cond: Any, concat_cond: Any = None, **kwargs: Any) -> Any:
-        if not getattr(self, "_stream_active_blocks", False) or getattr(self, "training", False):
-            return orig_forward(self, x, t, cond, concat_cond=concat_cond, **kwargs)
-
-        from trellis2.modules import sparse as sp
-        from trellis2.modules.utils import manual_cast
-        import torch.nn.functional as f_mod
-
-        dev = x.device
-        if concat_cond is not None:
-            x = sp.sparse_cat([x, concat_cond], dim=-1)
-        if isinstance(cond, list):
-            cond = sp.VarLenTensor.from_tensor_list(cond)
-
-        h = self.input_layer(x)
-        h = manual_cast(h, self.dtype)
-        t_emb = self.t_embedder(t)
-        if self.share_mod:
-            t_emb = self.adaLN_modulation(t_emb)
-        t_emb = manual_cast(t_emb, self.dtype)
-        cond = manual_cast(cond, self.dtype)
-
-        if self.pe_mode == "ape":
-            pe = self.pos_embedder(h.coords[:, 1:])
-            h = h + manual_cast(pe, self.dtype)
-
-        for block in self.blocks:
-            block.to(dev)
-            try:
-                h = block(h, t_emb, cond)
-            finally:
-                block.cpu()
-
-        h = manual_cast(h, x.dtype)
-        h = h.replace(f_mod.layer_norm(h.feats, h.feats.shape[-1:]))
-        h = self.out_layer(h)
-        return h
-
-    slat_flow_cls.to = _dit_to
-    slat_flow_cls.forward = _dit_forward
-    slat_flow_cls._trellis2_dit_stream_patched = True
 
 
 def _freeze_pipeline_parameters(pipeline: Any) -> int:
@@ -5817,34 +5477,13 @@ def install_trellis2_vram_optimizations(
                 dec._stream_active_blocks = force_decoder_stream
                 dec.cpu()
 
-    stream_dit = os.environ.get("TRELLIS2_STREAM_DIT_BLOCKS", "auto").strip().lower()
-    enable_dit_stream = stream_dit in {"1", "true", "yes", "on"} or (
-        stream_dit == "auto" and vram_gb is not None and vram_gb < 16.0
-    )
-    if enable_dit_stream:
-        patch_dit_block_streaming(SLatFlowModel)
-        for flow_name in (
-            "shape_slat_flow_model_512",
-            "shape_slat_flow_model_1024",
-            "tex_slat_flow_model_512",
-            "tex_slat_flow_model_1024",
-        ):
-            flow_mod = models_dict.get(flow_name)
-            if flow_mod is not None:
-                flow_mod._stream_active_blocks = True
-                flow_mod.cpu()
-
     log.info(
-        "Installed TRELLIS.2 VRAM + speed optimizations (reserve=%.1fGiB, voxel_chunk=%d..%d, token_chunk=%d..%d, batch_cfg=%s, kv_cache=%s, cudagraph=%s, cross_dec_cache=%s)",
+        "Installed TRELLIS.2 VRAM + speed optimizations (reserve=%.1fGiB, voxel_chunk=%d..%d, token_chunk=%d..%d)",
         VRAM_SAFETY_FLOOR_GB,
         DEFAULT_VOXEL_CHUNK_SIZE,
         FAST_VOXEL_CHUNK_ULTRA,
         DEFAULT_TOKEN_CHUNK_SIZE,
         FAST_TOKEN_CHUNK_HIGH,
-        os.environ.get("TRELLIS2_BATCH_CFG", "1") != "0",
-        os.environ.get("TRELLIS2_KV_CACHE", "1") != "0",
-        os.environ.get("TRELLIS2_CUDAGRAPH", "1") != "0",
-        os.environ.get("TRELLIS2_CROSS_DECODER_CACHE", "1") != "0",
     )
 
 
@@ -5962,9 +5601,8 @@ class Trellis2Engine:
             )
             self.stage = "moving_to_cuda"
             pipeline.cuda()
-            patch_torch_compile_modules(pipeline, torch)
             model_mgr: VRAMModelManager | None = None
-            if self.low_vram and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0":
+            if self.low_vram:
                 model_mgr = VRAMModelManager(pipeline, torch, vram_gb=self.vram_gb)
                 model_mgr.warm_initial_models(pipeline.device)
 
@@ -6505,8 +6143,6 @@ class Trellis2Engine:
             can_overlap_fill = bool(
                 mgr is not None
                 and not defer_tex_load
-                and os.environ.get("TRELLIS2_FAST_VRAM", "1") != "0"
-                and os.environ.get("TRELLIS2_STREAM_OVERLAP", "1") != "0"
                 and torch is not None
                 and torch.cuda.is_available()
                 and hasattr(torch.cuda, "Stream")
@@ -6615,9 +6251,8 @@ class Trellis2Engine:
             v = tex_voxels[0]
             del tex_voxels
             free_gb = _cuda_free_gb(torch)
-            stage_bake_cpu = os.environ.get("TRELLIS2_STAGE_BAKE_VOLUME_CPU", "1") != "0"
             spill_voxels = bool(
-                (res > 1024 and stage_bake_cpu) or (free_gb is not None and free_gb < (floor + 1.5))
+                (res > 1024) or (free_gb is not None and free_gb < (floor + 1.5))
             )
             v_coords = v.coords[:, 1:].cpu() if spill_voxels else v.coords[:, 1:].contiguous()
             v_attrs = v.feats.cpu() if spill_voxels else v.feats.contiguous()
@@ -6735,7 +6370,6 @@ class Trellis2Engine:
                     use_cuda
                     and postprocess_patched
                     and (self.low_vram or self.vram_gb is None or self.vram_gb < 32.0)
-                    and os.environ.get("TRELLIS2_STAGE_BAKE_VOLUME_CPU", "1") != "0"
                 )
                 bake_verts = mesh.vertices
                 bake_faces = mesh.faces
@@ -6815,50 +6449,14 @@ class Trellis2Engine:
             raise RuntimeError(f"Model is not ready (status={self.status}, error={self.error})")
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        allow_fallback = os.environ.get("TRELLIS2_OOM_FALLBACK", "1") != "0"
-        current_type = params.pipeline_type
         with self._gpu_lock:
-            while True:
-                retry_next: str | None = None
-                oom_detail = ""
-                try:
-                    return self._run_once(
-                        image, params, out_path, current_type, on_stage=on_stage
-                    )
-                except Exception as exc:
-                    next_type = OOM_FALLBACK_CHAIN.get(current_type)
-                    if (
-                        self._is_cuda_oom(exc)
-                        and self.low_vram
-                        and allow_fallback
-                        and next_type is not None
-                    ):
-                        tb_loc = ""
-                        if exc.__traceback__ is not None:
-                            tb_frames = traceback.extract_tb(exc.__traceback__)
-                            if tb_frames:
-                                last_f = tb_frames[-1]
-                                tb_loc = f" at {Path(last_f.filename).name}:{last_f.lineno} in {last_f.name}"
-                            traceback.clear_frames(exc.__traceback__)
-                        flat_msg = " ".join(s.strip() for s in str(exc).splitlines() if s.strip())
-                        oom_detail = f"{flat_msg[:260]}{tb_loc}"
-                        retry_next = next_type
-                    else:
-                        raise
-                if retry_next is not None:
-                    log.warning(
-                        "CUDA OOM on pipeline_type=%s (%s); clearing VRAM and retrying with %s.",
-                        current_type,
-                        oom_detail,
-                        retry_next,
-                    )
-                    if on_stage is not None:
-                        on_stage(f"retrying_{retry_next}_after_oom")
-                    self._release_vram(offload_models=True)
-                    free_after = _cuda_free_gb(self._torch)
-                    if free_after is not None:
-                        log.info("VRAM recovered after OOM cleanup: %.2f GiB free", free_after)
-                    current_type = retry_next
+            try:
+                return self._run_once(
+                    image, params, out_path, params.pipeline_type, on_stage=on_stage
+                )
+            except Exception as exc:
+                _clear_oom_traceback_frames(exc)
+                raise
 
 
 @dataclass
