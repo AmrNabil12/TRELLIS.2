@@ -3247,11 +3247,11 @@ def _qem_coarsen_slab_locked(
     target_faces: int,
     torch_mod: Any,
     lambda_el: float = 1e-2,
-    max_iters: int = 28,
+    max_iters: int = 48,
     lambda_skinny: float = 1e-3,
     min_normal_cos: float = 0.25,
 ) -> tuple[Any, Any]:
-    """Vectorized GPU/CPU QEM edge-collapse preserving manifold links, triangle shape, and locked seams."""
+    """Progressive 3-phase QEM edge-collapse preserving manifold links, triangle shape, and locked seams."""
     dev = v_sub.device
     v_cnt = int(v_sub.shape[0])
     f_cur = int(f_sub.shape[0])
@@ -3304,6 +3304,24 @@ def _qem_coarsen_slab_locked(
     bad_edge_keys = torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
     max_bad_keys = 2_000_000
 
+    # Progressive relaxation phases (only advance when current stricter phase stalls while f_cur > target_faces):
+    #   phase 0: manifold interiors only (locks seams, nm_v, bnd_v), strict normal/shape/link checks
+    #   phase 1: unlocks natural open boundaries (keeps seams + nm_v locked), gentler normal threshold
+    #   phase 2: unlocks pre-existing non-manifold vertices (keeps seams `is_locked` strictly immovable)
+    phase = 0
+    low_progress_streak = 0
+
+    def _next_phase(cur_p: int, has_b: bool, has_n: bool) -> int:
+        if cur_p == 0:
+            if has_b:
+                return 1
+            if has_n:
+                return 2
+            return 3
+        if cur_p == 1 and has_n:
+            return 2
+        return 3
+
     for _it in range(max_iters):
         f_cur = int(f.shape[0])
         if f_cur <= target_faces:
@@ -3326,35 +3344,70 @@ def _qem_coarsen_slab_locked(
         e0 = u_edges >> 32
         e1 = u_edges & 0xFFFFFFFF
 
-        # Protect seam vertices, natural open boundaries, and non-manifold vertices from any collapse
-        prot_nm = is_locked.clone()
+        nm_v = torch_mod.zeros((v_cnt,), dtype=torch_mod.bool, device=dev)
         nm_e = e_cnts > 2
-        if bool(nm_e.any()):
-            prot_nm[e0[nm_e]] = True
-            prot_nm[e1[nm_e]] = True
+        has_nm = bool(nm_e.any())
+        if has_nm:
+            nm_v[e0[nm_e]] = True
+            nm_v[e1[nm_e]] = True
 
-        prot = prot_nm.clone()
+        prot_nm = is_locked | nm_v
         bnd_e = e_cnts == 1
-        if bool(bnd_e.any()):
-            prot[e0[bnd_e]] = True
-            prot[e1[bnd_e]] = True
-        del e_cnts, bnd_e, nm_e
+        has_bnd = bool(bnd_e.any())
 
-        free_mask = (~prot[e0]) & (~prot[e1])
-        if not bool(free_mask.any()):
-            # Fallback for thin open ribbons where every edge touches a natural boundary;
-            # seam vertices (`is_locked`) and non-manifold vertices (`prot_nm`) stay immovable.
+        if phase == 0:
+            prot = prot_nm.clone()
+            if has_bnd:
+                prot[e0[bnd_e]] = True
+                prot[e1[bnd_e]] = True
+            free_mask = (~prot[e0]) & (~prot[e1])
+            del prot
+            if not bool(free_mask.any()):
+                np_idx = _next_phase(0, has_bnd, has_nm)
+                if np_idx > 2:
+                    del e_cnts, bnd_e, nm_e, prot_nm, u_edges, e0, e1, free_mask, nm_v
+                    break
+                phase = np_idx
+                bad_edge_keys = torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+                low_progress_streak = 0
+        if phase == 1:
             free_mask = (~prot_nm[e0]) & (~prot_nm[e1])
-        if bool(bad_edge_keys.numel() > 0) and bool(free_mask.any()):
-            free_mask &= ~torch_mod.isin(u_edges, bad_edge_keys)
-        del u_edges, prot, prot_nm
+            if not bool(free_mask.any()):
+                np_idx = _next_phase(1, has_bnd, has_nm)
+                if np_idx > 2:
+                    del e_cnts, bnd_e, nm_e, prot_nm, u_edges, e0, e1, free_mask, nm_v
+                    break
+                phase = np_idx
+                bad_edge_keys = torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+                low_progress_streak = 0
+        if phase == 2:
+            free_mask = (~is_locked[e0]) & (~is_locked[e1])
+
+        del e_cnts, bnd_e, nm_e, prot_nm
         c0 = e0[free_mask]
         c1 = e1[free_mask]
-        del e0, e1, free_mask
+        c_keys = u_edges[free_mask]
+        del u_edges, e0, e1, free_mask
+
+        if bool(bad_edge_keys.numel() > 0) and int(c_keys.numel()) > 0:
+            keep_cand = ~torch_mod.isin(c_keys, bad_edge_keys)
+            c0 = c0[keep_cand]
+            c1 = c1[keep_cand]
+            del keep_cand
+        del c_keys
 
         m = int(c0.shape[0])
         if m == 0:
+            del nm_v
+            np_idx = _next_phase(phase, has_bnd, has_nm)
+            if np_idx <= 2:
+                phase = np_idx
+                bad_edge_keys = torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+                low_progress_streak = 0
+                continue
             break
+
+        cur_min_cos = min_normal_cos if phase == 0 else (1e-4 if phase == 1 else 1e-6)
 
         # Regularized midpoint QEM cost (CuMesh-faithful; avoids pulling eyeballs onto mask rims)
         costs = torch_mod.empty((m,), dtype=torch_mod.float32, device=dev)
@@ -3371,7 +3424,8 @@ def _qem_coarsen_slab_locked(
             del s0, s1, p0_c, p1_c, pm_c, eq_c, qm_c, l2_c, sk_c
 
         remove_need = f_cur - target_faces
-        frac = min(1.0, max(0.25, (remove_need / max(1, 2 * m)) * 5.0))
+        min_frac = 0.25 if phase == 0 else 0.50
+        frac = min(1.0, max(min_frac, (remove_need / max(1, 2 * m)) * 6.0))
         if frac < 0.99 and m > 256:
             # Sample <=500k elements before torch.quantile (PyTorch limits quantile() to <= 2^24 elements)
             c_samp = costs[:: max(1, m // 500_000)].float()
@@ -3381,7 +3435,7 @@ def _qem_coarsen_slab_locked(
             del c_samp, cutoff, sel
             m = int(c0.shape[0])
             if m == 0:
-                del costs
+                del costs, nm_v
                 break
 
         # 32 log-cost tiers + avalanche hash tie-break prevents monotonic-chain stalling while keeping cost order
@@ -3423,6 +3477,13 @@ def _qem_coarsen_slab_locked(
 
         w_cnt = int(wc0.shape[0])
         if w_cnt == 0:
+            del nm_v
+            np_idx = _next_phase(phase, has_bnd, has_nm)
+            if np_idx <= 2:
+                phase = np_idx
+                bad_edge_keys = torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+                low_progress_streak = 0
+                continue
             break
 
         # Sort winners by exact cost BEFORE capping so lowest-error edges collapse uniformly across the slab
@@ -3482,6 +3543,9 @@ def _qem_coarsen_slab_locked(
         del w_tag, v_to
 
         win_ok = torch_mod.ones((w_cnt,), dtype=torch_mod.bool, device=dev)
+        win_touch_nm = nm_v[wc0] | nm_v[wc1]
+        del nm_v
+
         if orig_chunks:
             f_s_orig = torch_mod.cat(orig_chunks, dim=0)
             f_s_new = torch_mod.cat(new_chunks, dim=0)
@@ -3504,21 +3568,36 @@ def _qem_coarsen_slab_locked(
             n_l2 = (ne0.pow(2).sum(dim=-1) + ne1.pow(2).sum(dim=-1) + ne2.pow(2).sum(dim=-1)).clamp_min(1e-12)
             o_shape = 2.0 * 1.7320508 * on_l / o_l2
             n_shape = 2.0 * 1.7320508 * nn_l / n_l2
+            t_l = f_s_tag.long()
+            is_manifold_w = ~win_touch_nm
+            man_mask = is_manifold_w[t_l]
+
+            dot_n = (old_n * new_n).sum(dim=-1)
+            cos_req = torch_mod.where(
+                man_mask,
+                torch_mod.tensor(cur_min_cos, dtype=dot_n.dtype, device=dev),
+                torch_mod.tensor(-0.10, dtype=dot_n.dtype, device=dev),
+            )
             bad_tri = (
-                ((old_n * new_n).sum(dim=-1) <= min_normal_cos * on_l * nn_l)
+                (dot_n <= cos_req * on_l * nn_l)
                 | (nn_l <= 1e-12)
-                | (nn_l <= 1e-3 * on_l)
-                | ((n_shape < 0.08 * o_shape) & (n_shape < 0.08))
+                | (
+                    man_mask
+                    & (
+                        (nn_l <= (1e-3 if phase == 0 else 1e-5) * on_l)
+                        | ((phase < 2) & (n_shape < 0.08 * o_shape) & (n_shape < 0.08))
+                    )
+                )
             )
             if bool(bad_tri.any()):
-                win_ok[f_s_tag[bad_tri].long()] = False
-            del old_p, new_p, oe0, oe1, oe2, ne0, ne1, ne2, old_n, new_n, on_l, nn_l, o_l2, n_l2, o_shape, n_shape, bad_tri
+                win_ok[t_l[bad_tri]] = False
+            del old_p, new_p, oe0, oe1, oe2, ne0, ne1, ne2, old_n, new_n, on_l, nn_l, o_l2, n_l2, o_shape, n_shape, bad_tri, dot_n, cos_req
 
-            t_l = f_s_tag.long()
+            # Enforce strict link-condition & manifoldness checks on all collapses not already touching NM geometry
             is_keep_col = f_s_new == wc0[t_l].unsqueeze(-1)
-            valid_s = is_keep_col.sum(dim=-1) == 1
-            if bool((~valid_s).any()):
-                win_ok[t_l[~valid_s]] = False
+            valid_s = (is_keep_col.sum(dim=-1) == 1) & man_mask
+            if bool((man_mask & (~(is_keep_col.sum(dim=-1) == 1))).any()):
+                win_ok[t_l[man_mask & (~(is_keep_col.sum(dim=-1) == 1))]] = False
             if bool(valid_s.any()):
                 f_so_v = f_s_orig[valid_s]
                 f_sn_v = f_s_new[valid_s]
@@ -3573,10 +3652,10 @@ def _qem_coarsen_slab_locked(
                 if bool(bad_dup.any()):
                     win_ok[u_dk[bad_dup][:, 0]] = False
                 del f_so_v, f_sn_v, t_lv, keep_v, others, is_c0, is_c1, olo, ohi, dup_key, u_dk, u_dc, bad_dup
-            del f_s_orig, f_s_new, f_s_tag, is_keep_col, valid_s, t_l
+            del f_s_orig, f_s_new, f_s_tag, is_keep_col, valid_s, t_l, is_manifold_w, man_mask
         else:
             del orig_chunks, new_chunks, tag_chunks
-        del del_opp_v, del_opp_t, p_tent
+        del del_opp_v, del_opp_t, p_tent, win_touch_nm
 
         if bool((~win_ok).any()) and int(bad_edge_keys.numel()) < max_bad_keys:
             rej0 = torch_mod.minimum(wc0[~win_ok], wc1[~win_ok])
@@ -3589,6 +3668,14 @@ def _qem_coarsen_slab_locked(
         w_p = w_p[win_ok]
         del win_ok
         if int(wc0.shape[0]) == 0:
+            low_progress_streak += 1
+            if low_progress_streak >= 2:
+                np_idx = _next_phase(phase, has_bnd, has_nm)
+                if np_idx <= 2:
+                    phase = np_idx
+                    low_progress_streak = 0
+                    bad_edge_keys = torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+                    continue
             if int(bad_edge_keys.numel()) > 0 and int(bad_edge_keys.numel()) < max_bad_keys:
                 continue
             break
@@ -3611,6 +3698,18 @@ def _qem_coarsen_slab_locked(
         del v_to
         f = torch_mod.cat(surv_list, dim=0) if surv_list else torch_mod.empty((0, 3), dtype=torch_mod.int32, device=dev)
         del surv_list
+
+        removed = f_cur - int(f.shape[0])
+        if removed < max(16, int(0.01 * f_cur)):
+            low_progress_streak += 1
+            if low_progress_streak >= 2 and int(f.shape[0]) > target_faces:
+                np_idx = _next_phase(phase, has_bnd, has_nm)
+                if np_idx <= 2:
+                    phase = np_idx
+                    low_progress_streak = 0
+                    bad_edge_keys = torch_mod.empty((0,), dtype=torch_mod.int64, device=dev)
+        else:
+            low_progress_streak = 0
 
     del qem, avg_skinny_v, bad_edge_keys
     v_out = (p / inv_scale) + center
@@ -3754,30 +3853,30 @@ def _simplify_mesh_oom_safe(
     orig_dev = verts.device
     work_dev = torch_mod.device("cuda") if use_cuda else orig_dev
 
-    # CuMesh.simplify allocates ~185 bytes/face across edges, CUB sort temp, vert2face, and QEMs.
-    # Proactively bypass doomed single-shot simplify calls when F exceeds ~85% of free VRAM.
-    single_shot_cap: int | None = None
-    if use_cuda and hasattr(torch_mod.cuda, "mem_get_info"):
-        try:
-            free_bytes, _ = torch_mod.cuda.mem_get_info(0)
-            single_shot_cap = max(25_000_000, int((free_bytes * 0.85) // 185))
-        except Exception:
-            single_shot_cap = 105_000_000
-    env_cap = os.environ.get("TRELLIS2_SINGLE_SHOT_SIMPLIFY_MAX_FACES", "").strip()
-    if env_cap:
-        single_shot_cap = int(env_cap)
-
-    skip_single_shot = bool(single_shot_cap is not None and f_count > single_shot_cap)
-
     v_work = verts.to(work_dev).float().contiguous() if verts.device != work_dev else verts.float().contiguous()
     f_work = faces.to(work_dev).int().contiguous() if faces.device != work_dev else faces.int().contiguous()
-    # Release Mesh references so vertices+faces aren't held twice during simplify (~2.7 GiB saved)
+    # Release Mesh references FIRST so vertices+faces aren't held twice and free VRAM measurement is accurate
     mesh_obj.vertices = None
     mesh_obj.faces = None
     del verts, faces
     if use_cuda:
         gc.collect()
         torch_mod.cuda.empty_cache()
+
+    # CuMesh.simplify allocates ~220 bytes/face on DualGrid/complex meshes across edges, CUB sort temp, vert2face, and QEMs.
+    # Account for freed caller buffers (~2.5-3 GiB) once Stage-1 offloads to CPU, keeping conservative 80% headroom.
+    single_shot_cap: int | None = None
+    if use_cuda and hasattr(torch_mod.cuda, "mem_get_info"):
+        try:
+            free_bytes, _ = torch_mod.cuda.mem_get_info(0)
+            single_shot_cap = max(20_000_000, int((free_bytes * 0.80) // 220))
+        except Exception:
+            single_shot_cap = 82_000_000
+    env_cap = os.environ.get("TRELLIS2_SINGLE_SHOT_SIMPLIFY_MAX_FACES", "").strip()
+    if env_cap:
+        single_shot_cap = int(env_cap)
+
+    skip_single_shot = bool(single_shot_cap is not None and f_count > single_shot_cap)
 
     if not skip_single_shot:
         # Keep lightweight CPU backup for oversized meshes (>16.77M) in case single-shot still OOMs
@@ -3807,6 +3906,14 @@ def _simplify_mesh_oom_safe(
             eff_cap = max(target, int(f_count * 0.72))
     else:
         eff_cap = int(single_shot_cap)  # type: ignore[arg-type]
+        if use_cuda and not env_cap and hasattr(torch_mod.cuda, "mem_get_info"):
+            try:
+                free_post_bytes, _ = torch_mod.cuda.mem_get_info(0)
+                # Total clean VRAM available to Stage 2 after v_work/f_work are freed after Stage 1
+                clean_s2_bytes = free_post_bytes + int(v_work.numel()) * 4 + int(f_work.numel()) * 4
+                eff_cap = max(eff_cap, int((clean_s2_bytes * 0.80) // 220))
+            except Exception:
+                pass
         log.info(
             "Using seam-locked 2-stage GPU simplify for %d -> %d faces (single-shot cap=%d)",
             f_count,
@@ -3814,12 +3921,12 @@ def _simplify_mesh_oom_safe(
             eff_cap,
         )
 
-    # Stage 1: Seam-locked, globally welded QEM coarsening down to ~48M-60M (well below eff_cap & >target so Stage 2 runs globally).
-    safe_s2_cap = max(target, int(eff_cap * 0.60))
+    # Stage 1: Seam-locked, globally welded QEM coarsening down to ~48M-55M (well below eff_cap & >target).
+    safe_s2_cap = max(target, min(55_000_000, int(eff_cap * 0.65)) if eff_cap >= 55_000_000 else int(eff_cap * 0.65))
     if safe_s2_cap <= target:
         safe_s2_cap = max(target, int(eff_cap * 0.90))
     desired_mid = max(
-        target * 3 if eff_cap >= target * 4 else max(target + 1, int(target * 1.5)),
+        target * 3 if eff_cap >= target * 4 else max(target + 1, int(target * 1.65)),
         48_000_000 if f_count > 60_000_000 else min(f_count, target * 2),
     )
     mid_target = min(f_count, desired_mid, safe_s2_cap)
@@ -3829,14 +3936,39 @@ def _simplify_mesh_oom_safe(
         v_work, f_work, mid_target, num_slabs, torch_mod, use_cuda, phase_shift=0.0
     )
     del v_work, f_work
+    if use_cuda:
+        gc.collect()
+        torch_mod.cuda.empty_cache()
+
+    cur_f_cnt = int(all_f.shape[0])
+    # Proactively run shifted-slab Stage-1 pass if pass-1 stopped above Stage-2 safe VRAM capacity
+    pre_s2_gate = max(target, eff_cap if eff_cap < 1_000_000 else min(int(safe_s2_cap * 1.15), int(eff_cap * 0.82)))
+    if cur_f_cnt > pre_s2_gate:
+        log.info(
+            "Stage-1 pass-1 left %d faces (> Stage-2 gate %d); coarsening shifted slabs -> %d before global CuMesh",
+            cur_f_cnt,
+            pre_s2_gate,
+            mid_target,
+        )
+        v_shift = all_v.to(work_dev).contiguous() if all_v.device != work_dev else all_v.contiguous()
+        f_shift = all_f.to(work_dev).contiguous() if all_f.device != work_dev else all_f.contiguous()
+        del all_v, all_f
+        shift_slabs = max(2, min(8, (cur_f_cnt + 34_999_999) // 35_000_000))
+        all_v, all_f = _weld_and_coarsen_slabs(
+            v_shift, f_shift, mid_target, shift_slabs, torch_mod, use_cuda, phase_shift=0.5
+        )
+        del v_shift, f_shift
+        if use_cuda:
+            gc.collect()
+            torch_mod.cuda.empty_cache()
+        cur_f_cnt = int(all_f.shape[0])
 
     # Stage 2: Single-shot global CuMesh.simplify(target) across the 100% welded intermediate mesh.
     # Unifies density across former seam bands and eliminates slab boundary artifacts completely.
-    cur_f_cnt = int(all_f.shape[0])
     if cur_f_cnt > target:
+        v_bak_s2 = all_v.cpu()
+        f_bak_s2 = all_f.cpu()
         for attempt in range(2):
-            v_bak_s2 = all_v.cpu() if attempt == 0 else None
-            f_bak_s2 = all_f.cpu() if attempt == 0 else None
             all_v_dev = all_v.to(work_dev).contiguous() if all_v.device != work_dev else all_v.contiguous()
             all_f_dev = all_f.to(work_dev).contiguous() if all_f.device != work_dev else all_f.contiguous()
             del all_v, all_f
@@ -3847,9 +3979,37 @@ def _simplify_mesh_oom_safe(
                 del v_bak_s2, f_bak_s2
                 break
             except Exception as exc:
-                if not _is_oom_like(exc) or attempt >= 1 or v_bak_s2 is None or f_bak_s2 is None:
+                if not _is_oom_like(exc):
+                    del v_bak_s2, f_bak_s2
                     raise
-                tighter_mid = max(target, int(cur_f_cnt * 0.65))
+                if attempt >= 1:
+                    log.warning(
+                        "Stage-2 CuMesh.simplify(%d) hit VRAM limit twice (at %d faces); finishing via seam-locked QEM -> %d",
+                        target,
+                        cur_f_cnt,
+                        target,
+                    )
+                    v_last = v_bak_s2.to(work_dev).contiguous()
+                    f_last = f_bak_s2.to(work_dev).contiguous()
+                    del v_bak_s2, f_bak_s2
+                    last_slabs = max(2, min(8, (cur_f_cnt + 34_999_999) // 35_000_000))
+                    all_v, all_f = _weld_and_coarsen_slabs(
+                        v_last, f_last, target, last_slabs, torch_mod, use_cuda, phase_shift=0.25
+                    )
+                    del v_last, f_last
+                    if use_cuda:
+                        gc.collect()
+                        torch_mod.cuda.empty_cache()
+                    break
+
+                tighter_mid = max(
+                    target,
+                    min(
+                        int(safe_s2_cap * 0.85),
+                        int(eff_cap * 0.55),
+                        int(cur_f_cnt * 0.55),
+                    ),
+                )
                 log.warning(
                     "Stage-2 CuMesh.simplify(%d) hit VRAM limit at %d faces; coarsening shifted slabs -> %d and retrying",
                     target,
@@ -3858,12 +4018,19 @@ def _simplify_mesh_oom_safe(
                 )
                 v_retry = v_bak_s2.to(work_dev).contiguous()
                 f_retry = f_bak_s2.to(work_dev).contiguous()
-                del v_bak_s2, f_bak_s2
+                retry_slabs = max(2, min(8, (cur_f_cnt + 34_999_999) // 35_000_000))
                 all_v, all_f = _weld_and_coarsen_slabs(
-                    v_retry, f_retry, tighter_mid, num_slabs, torch_mod, use_cuda, phase_shift=0.5
+                    v_retry, f_retry, tighter_mid, retry_slabs, torch_mod, use_cuda, phase_shift=0.37
                 )
+                del v_retry, f_retry
+                if use_cuda:
+                    gc.collect()
+                    torch_mod.cuda.empty_cache()
+                v_bak_s2 = all_v.cpu()
+                f_bak_s2 = all_f.cpu()
                 cur_f_cnt = int(all_f.shape[0])
                 if cur_f_cnt <= target:
+                    del v_bak_s2, f_bak_s2
                     break
 
     mesh_obj.vertices = all_v.to(orig_dev) if all_v.device != orig_dev else all_v
@@ -4599,7 +4766,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                                 vertices = None
                                 faces = None
                             free_pre_simp = _cuda_free_gb(t_mod)
-                            if free_pre_simp is None or (free_pre_simp * (1024**3)) < (dc_f_cnt * 185 * 1.15):
+                            if free_pre_simp is None or (free_pre_simp * (1024**3)) < (dc_f_cnt * 220 * 1.15):
                                 del bvh
                                 bvh = None
                         # Release all PyTorch cached segments BEFORE CuMesh C++ simplify calls raw cudaMalloc()
