@@ -25,17 +25,24 @@ if [[ -n "${STORAGE_ROOT}" ]]; then
     export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${STORAGE_ROOT}/torchinductor_cache}"
     export FLEX_GEMM_AUTOTUNE_CACHE_PATH="${FLEX_GEMM_AUTOTUNE_CACHE_PATH:-${STORAGE_ROOT}/flex_gemm_autotune_cache.json}"
     mkdir -p "${TRELLIS2_JOBS_DIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
+    echo "[start.sh] STORAGE_ROOT=${STORAGE_ROOT} (persistent volume mounted)"
 else
     export HF_HOME="${HF_HOME:-/root/.cache/huggingface}"
     export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/.cache/triton}"
     export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/root/.cache/torchinductor}"
     export FLEX_GEMM_AUTOTUNE_CACHE_PATH="${FLEX_GEMM_AUTOTUNE_CACHE_PATH:-/root/.cache/flex_gemm_autotune_cache.json}"
     mkdir -p "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
+    echo "[start.sh] STORAGE_ROOT=none (/runpod-volume and /workspace unavailable; using container disk)"
 fi
 export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
 export TORCHINDUCTOR_AUTOGRAD_CACHE="${TORCHINDUCTOR_AUTOGRAD_CACHE:-1}"
 export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
 mkdir -p "${HF_HOME}"
+echo "[start.sh] HF_HOME=${HF_HOME} TRITON_CACHE_DIR=${TRITON_CACHE_DIR} TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR} TRELLIS2_JOBS_DIR=${TRELLIS2_JOBS_DIR:-<default>}"
+df -h / "${STORAGE_ROOT:-/}" 2>/dev/null || true
+if [[ -n "${STORAGE_ROOT}" ]]; then
+    ls -la "${STORAGE_ROOT}" 2>/dev/null || true
+fi
 
 if [[ -z "${HF_TOKEN:-}" ]] && [[ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
     echo "WARNING: HF_TOKEN is not set." >&2

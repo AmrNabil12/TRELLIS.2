@@ -5763,7 +5763,28 @@ class Trellis2Engine:
             if token:
                 os.environ.setdefault("HF_TOKEN", token)
 
+            def _hf_cache_summary() -> str:
+                hf_dir = Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
+                hub_dir = hf_dir / "hub" if (hf_dir / "hub").is_dir() else hf_dir
+                repos: list[str] = []
+                try:
+                    if hub_dir.is_dir():
+                        repos = sorted(p.name for p in hub_dir.iterdir() if p.is_dir() and p.name.startswith("models--"))
+                except OSError:
+                    pass
+                disk_info = ""
+                try:
+                    usage_path = hf_dir if hf_dir.exists() else Path("/")
+                    du = shutil.disk_usage(usage_path)
+                    disk_info = f"disk_used={du.used / (1024**3):.2f}GiB disk_free={du.free / (1024**3):.2f}GiB"
+                except OSError:
+                    pass
+                loc = "network_volume" if str(hf_dir).startswith(("/runpod-volume", "/workspace")) else "container_disk"
+                return f"HF_HOME={hf_dir} ({loc}, {disk_info}, cached_repos={repos})"
+
+            log.info("Pre-load HF storage status: %s", _hf_cache_summary())
             pipeline = Trellis2ImageTo3DPipeline.from_pretrained(self.model_id)
+            log.info("Post-load HF storage status: %s", _hf_cache_summary())
             # low_vram MUST be set before pipeline.cuda() because Pipeline.to() checks self.low_vram
             pipeline.low_vram = self.low_vram
             install_trellis2_vram_optimizations(
