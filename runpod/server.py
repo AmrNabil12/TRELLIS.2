@@ -3430,28 +3430,26 @@ def _qem_coarsen_slab_locked(
             cos_req = torch_mod.where(
                 man_mask,
                 torch_mod.tensor(cur_min_cos, dtype=dot_n.dtype, device=dev),
-                torch_mod.tensor(-0.10, dtype=dot_n.dtype, device=dev),
+                torch_mod.tensor(0.10, dtype=dot_n.dtype, device=dev),
             )
             bad_tri = (
                 (dot_n <= cos_req * on_l * nn_l)
                 | (nn_l <= 1e-12)
-                | (
-                    man_mask
-                    & (
-                        (nn_l <= (1e-3 if phase == 0 else 1e-5) * on_l)
-                        | ((phase < 2) & (n_shape < 0.08 * o_shape) & (n_shape < 0.08))
-                    )
-                )
+                | (nn_l <= (1e-3 if phase == 0 else (1e-5 if phase == 1 else 1e-4)) * on_l)
+                | (man_mask & (phase < 2) & (n_shape < 0.08 * o_shape) & (n_shape < 0.08))
             )
             if bool(bad_tri.any()):
                 win_ok[t_l[bad_tri]] = False
             del old_p, new_p, oe0, oe1, oe2, ne0, ne1, ne2, old_n, new_n, on_l, nn_l, o_l2, n_l2, o_shape, n_shape, bad_tri, dot_n, cos_req
 
-            # Enforce strict link-condition & manifoldness checks on all collapses not already touching NM geometry
+            # Enforce link-condition & <=2 edge degree on manifold edges; block duplicate/opposite stacked faces on ALL edges
             is_keep_col = f_s_new == wc0[t_l].unsqueeze(-1)
-            valid_s = (is_keep_col.sum(dim=-1) == 1) & man_mask
-            if bool((man_mask & (~(is_keep_col.sum(dim=-1) == 1))).any()):
-                win_ok[t_l[man_mask & (~(is_keep_col.sum(dim=-1) == 1))]] = False
+            valid_all = is_keep_col.sum(dim=-1) == 1
+            bad_multi_col = man_mask & (~valid_all)
+            if bool(bad_multi_col.any()):
+                win_ok[t_l[bad_multi_col]] = False
+            del bad_multi_col
+            valid_s = valid_all & man_mask
             if bool(valid_s.any()):
                 f_so_v = f_s_orig[valid_s]
                 f_sn_v = f_s_new[valid_s]
@@ -3496,17 +3494,21 @@ def _qem_coarsen_slab_locked(
                 bad_nm = ku_cnts > 2
                 if bool(bad_nm.any()):
                     win_ok[u_ku[bad_nm] >> 32] = False
-                del e_ku, u_ku, ku_cnts, bad_nm
+                del e_ku, u_ku, ku_cnts, bad_nm, f_so_v, f_sn_v, t_lv, keep_v, others, is_c0, is_c1
 
-                olo = torch_mod.minimum(others[:, 0], others[:, 1])
-                ohi = torch_mod.maximum(others[:, 0], others[:, 1])
-                dup_key = torch_mod.stack([t_lv, olo, ohi], dim=-1)
+            if bool(valid_all.any()):
+                f_sd = f_s_new[valid_all]
+                t_ld = t_l[valid_all]
+                others_d = f_sd[~is_keep_col[valid_all]].reshape(-1, 2)
+                olo = torch_mod.minimum(others_d[:, 0], others_d[:, 1])
+                ohi = torch_mod.maximum(others_d[:, 0], others_d[:, 1])
+                dup_key = torch_mod.stack([t_ld, olo, ohi], dim=-1)
                 u_dk, u_dc = torch_mod.unique(dup_key, dim=0, return_counts=True)
                 bad_dup = u_dc > 1
                 if bool(bad_dup.any()):
                     win_ok[u_dk[bad_dup][:, 0]] = False
-                del f_so_v, f_sn_v, t_lv, keep_v, others, is_c0, is_c1, olo, ohi, dup_key, u_dk, u_dc, bad_dup
-            del f_s_orig, f_s_new, f_s_tag, is_keep_col, valid_s, t_l, is_manifold_w, man_mask
+                del f_sd, t_ld, others_d, olo, ohi, dup_key, u_dk, u_dc, bad_dup
+            del f_s_orig, f_s_new, f_s_tag, is_keep_col, valid_s, valid_all, t_l, is_manifold_w, man_mask
         else:
             del orig_chunks, new_chunks, tag_chunks
         del del_opp_v, del_opp_t, p_tent, win_touch_nm
@@ -3891,6 +3893,107 @@ def _simplify_mesh_oom_safe(
     mesh_obj.faces = all_f.to(orig_dev) if all_f.device != orig_dev else all_f
 
 
+def _clean_pre_remesh_mesh(mesh_obj: Any, torch_mod: Any) -> None:
+    """Drop degenerate/duplicate faces left by high-ratio simplification before fill_holes or remeshing."""
+    verts = getattr(mesh_obj, "vertices", None)
+    faces = getattr(mesh_obj, "faces", None)
+    if verts is None or faces is None or int(getattr(faces, "shape", (0,))[0]) == 0:
+        return
+    try:
+        import cumesh  # type: ignore[import-not-found]
+    except Exception:
+        return
+    orig_dev = verts.device
+    v_bak = verts.cpu()
+    f_bak = faces.cpu()
+    cm = cumesh.CuMesh()
+    try:
+        v_dev = verts.cuda() if getattr(verts.device, "type", "") != "cuda" else verts
+        f_dev = faces.cuda() if getattr(faces.device, "type", "") != "cuda" else faces
+        mesh_obj.vertices = None
+        mesh_obj.faces = None
+        del verts, faces
+        cm.init(v_dev, f_dev)
+        del v_dev, f_dev
+        if hasattr(cm, "remove_degenerate_faces"):
+            cm.remove_degenerate_faces()
+        if hasattr(cm, "remove_duplicate_faces"):
+            cm.remove_duplicate_faces()
+        v_clean, f_clean = cm.read()
+        v_clean, f_clean = _compact_mesh_vertices(v_clean, f_clean, torch_mod)
+        mesh_obj.vertices = v_clean.to(orig_dev) if v_clean.device != orig_dev else v_clean
+        mesh_obj.faces = f_clean.to(orig_dev) if f_clean.device != orig_dev else f_clean
+    except Exception as exc:
+        if _is_oom_like(exc):
+            if exc.__traceback__ is not None:
+                traceback.clear_frames(exc.__traceback__)
+            _clear_sticky_cuda_error(torch_mod)
+            mesh_obj.vertices = v_bak.to(orig_dev) if orig_dev.type == "cuda" else v_bak
+            mesh_obj.faces = f_bak.to(orig_dev) if orig_dev.type == "cuda" else f_bak
+            log.warning("Skipping pre-remesh duplicate cleanup due to VRAM OOM (%s)", exc)
+        else:
+            raise
+    finally:
+        del cm, v_bak, f_bak
+
+
+def _remove_tiny_mesh_components(
+    mesh_obj: Any,
+    torch_mod: Any,
+    *,
+    min_faces: int = 80,
+    max_rel_area: float = 2e-4,
+) -> int:
+    """Remove floating micro-speck components while preserving real detached subparts."""
+    if not (hasattr(mesh_obj, "read") and hasattr(mesh_obj, "init")):
+        return 0
+    num_f = int(getattr(mesh_obj, "num_faces", 0))
+    if num_f <= max(32, min_faces * 2):
+        return 0
+    try:
+        import numpy as np
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+    except Exception:
+        return 0
+
+    v_t, f_t = mesh_obj.read()
+    v_np = v_t.detach().cpu().numpy()
+    f_np = f_t.detach().cpu().numpy()
+    n_v = int(v_np.shape[0])
+    n_f = int(f_np.shape[0])
+    if n_v == 0 or n_f <= min_faces:
+        return 0
+
+    rows = np.concatenate([f_np[:, 0], f_np[:, 1], f_np[:, 2]])
+    cols = np.concatenate([f_np[:, 1], f_np[:, 2], f_np[:, 0]])
+    adj = coo_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(n_v, n_v))
+    n_cc, labels = connected_components(adj, directed=False, return_labels=True)
+    if n_cc <= 1:
+        return 0
+
+    f_cc = labels[f_np[:, 0]]
+    e1 = v_np[f_np[:, 1]] - v_np[f_np[:, 0]]
+    e2 = v_np[f_np[:, 2]] - v_np[f_np[:, 0]]
+    areas = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+    tot_area = float(areas.sum())
+    if tot_area <= 0.0:
+        return 0
+
+    cc_nf = np.bincount(f_cc, minlength=n_cc)
+    cc_ar = np.bincount(f_cc, weights=areas, minlength=n_cc)
+    keep_mask_np = ~((cc_nf[f_cc] <= min_faces) & (cc_ar[f_cc] < max_rel_area * tot_area))
+    dropped = int((~keep_mask_np).sum())
+    if dropped == 0 or dropped >= n_f:
+        return 0
+
+    keep_idx = torch_mod.from_numpy(keep_mask_np).to(device=f_t.device)
+    v_kept, f_kept = _compact_mesh_vertices(v_t, f_t[keep_idx], torch_mod)
+    del v_t, f_t, keep_idx
+    mesh_obj.init(v_kept, f_kept)
+    return dropped
+
+
 def patch_mesh_simplify_noop(mesh_cls: Any, torch_mod: Any = None, cumesh_mod: Any = None) -> None:
     """Skip redundant CuMesh build+readback when <= target and avoid duplicate GPU buffers on simplify."""
     if mesh_cls is None or _is_already_patched(mesh_cls, "_trellis2_simplify_patched"):
@@ -3938,7 +4041,7 @@ def gpu_dilate_uv_gutters(
     torch_mod: Any,
     f_mod: Any,
     device: Any = None,
-    num_iters: int = 6,
+    num_iters: int = 8,
 ) -> tuple[Any, Any, Any, Any]:
     """Dilate UV island borders into empty UV gutters on GPU (<5ms) while keeping 100% of valid texels bit-exact."""
     import numpy as np
@@ -4547,6 +4650,12 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 mesh.remove_duplicate_faces()
                 mesh.repair_non_manifold_edges()
                 mesh.remove_small_connected_components(1e-5)
+                _remove_tiny_mesh_components(
+                    mesh,
+                    t_mod,
+                    min_faces=max(12, min(96, int(decimation_target) // 20_000)),
+                    max_rel_area=2e-4,
+                )
                 mesh.fill_holes(max_hole_perimeter=3e-2)
                 if verbose:
                     print(f"After final cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
@@ -4610,6 +4719,12 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                         mesh.repair_non_manifold_edges()
                     if hasattr(mesh, "remove_small_connected_components"):
                         mesh.remove_small_connected_components(1e-5)
+                    _remove_tiny_mesh_components(
+                        mesh,
+                        t_mod,
+                        min_faces=max(12, min(96, int(decimation_target) // 20_000)),
+                        max_rel_area=2e-4,
+                    )
                     if hasattr(mesh, "fill_holes"):
                         try:
                             mesh.fill_holes(max_hole_perimeter=5e-2)
@@ -4744,41 +4859,49 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                     mode="trilinear",
                 )
                 sampled_flat = sampled[0] if (sampled.ndim == 3 and int(sampled.shape[0]) == 1) else sampled
-                # Recover rare empty-voxel misses (<1 voxel drift from surface simplification) from adjacent voxels
+                # Recover rare empty-voxel misses (<1 voxel drift from surface simplification) symmetrically by shell radius
                 alpha_slice = attr_layout.get("alpha")
                 if alpha_slice is not None and sampled_flat.ndim == 2 and int(sampled_flat.shape[0]) == n_valid:
                     best_a = sampled_flat[..., alpha_slice].amax(dim=-1)
                     miss_mask = best_a <= 1e-3
-                    n_miss = int(miss_mask.sum().item())
-                    if 0 < n_miss < n_valid:
+                    if bool(miss_mask.any()) and not bool(miss_mask.all()):
                         sampled_flat = sampled_flat.clone()
-                        miss_grid = grid_coords[miss_mask]
-                        miss_vals = sampled_flat[miss_mask]
-                        miss_best_a = best_a[miss_mask]
-                        for delta in (
-                            (0.85, 0.0, 0.0),
-                            (-0.85, 0.0, 0.0),
-                            (0.0, 0.85, 0.0),
-                            (0.0, -0.85, 0.0),
-                            (0.0, 0.0, 0.85),
-                            (0.0, 0.0, -0.85),
-                        ):
-                            d_vec = t_mod.tensor(delta, dtype=miss_grid.dtype, device=miss_grid.device)
-                            probe = grid_sample_fn(
-                                attr_vol_dev,
-                                coords_batch,
-                                shape=vol_shape,
-                                grid=(miss_grid + d_vec).reshape(1, -1, 3),
-                                mode="trilinear",
-                            )
-                            probe_flat = probe[0] if (probe.ndim == 3 and int(probe.shape[0]) == 1) else probe
-                            probe_a = probe_flat[..., alpha_slice].amax(dim=-1)
-                            better = (probe_a > miss_best_a) & (probe_a > 1e-3)
-                            if bool(better.any()):
-                                miss_vals = t_mod.where(better.unsqueeze(-1), probe_flat, miss_vals)
-                                miss_best_a = t_mod.maximum(miss_best_a, probe_a)
-                        sampled_flat[miss_mask] = miss_vals
-                        del miss_grid, miss_vals, miss_best_a
+                        cur_idx = t_mod.nonzero(miss_mask, as_tuple=False).squeeze(-1)
+                        for step_r in (0.45, 0.85):
+                            if int(cur_idx.numel()) == 0:
+                                break
+                            cur_grid = grid_coords[cur_idx]
+                            val_sum = t_mod.zeros((int(cur_idx.numel()), attr_channels), dtype=sampled_flat.dtype, device=sampled_flat.device)
+                            w_sum = t_mod.zeros((int(cur_idx.numel()),), dtype=sampled_flat.dtype, device=sampled_flat.device)
+                            for delta in (
+                                (step_r, 0.0, 0.0),
+                                (-step_r, 0.0, 0.0),
+                                (0.0, step_r, 0.0),
+                                (0.0, -step_r, 0.0),
+                                (0.0, 0.0, step_r),
+                                (0.0, 0.0, -step_r),
+                            ):
+                                d_vec = t_mod.tensor(delta, dtype=cur_grid.dtype, device=cur_grid.device)
+                                probe = grid_sample_fn(
+                                    attr_vol_dev,
+                                    coords_batch,
+                                    shape=vol_shape,
+                                    grid=(cur_grid + d_vec).reshape(1, -1, 3),
+                                    mode="trilinear",
+                                )
+                                probe_flat = probe[0] if (probe.ndim == 3 and int(probe.shape[0]) == 1) else probe
+                                probe_a = probe_flat[..., alpha_slice].amax(dim=-1)
+                                hit = probe_a > 1e-3
+                                if bool(hit.any()):
+                                    w = t_mod.where(hit, probe_a, t_mod.zeros_like(probe_a))
+                                    val_sum.addcmul_(probe_flat, w.unsqueeze(-1))
+                                    w_sum.add_(w)
+                            recovered = w_sum > 1e-3
+                            if bool(recovered.any()):
+                                rec_idx = cur_idx[recovered]
+                                sampled_flat[rec_idx] = val_sum[recovered] / w_sum[recovered].unsqueeze(-1)
+                            cur_idx = cur_idx[~recovered]
+                        del cur_idx
                 attrs[mask] = sampled_flat
                 del grid_coords, coords_batch, sampled, sampled_flat
             del attr_vol_dev, coords_dev, valid_pos
@@ -4808,6 +4931,9 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             if bool((mask_np & (alpha[..., 0] >= 8)).any()):
                 miss_uv = (mask_np & (alpha[..., 0] < 8)).astype(np_mod.uint8)
                 mask_inv = np_mod.maximum(mask_inv, miss_uv)
+                valid_al = alpha[mask_inv == 0, 0]
+                if alpha_mode == "OPAQUE" and valid_al.size > 0 and int(valid_al.min()) >= 240:
+                    alpha[..., 0] = 255
             base_color, metallic, roughness, alpha = _parallel_pbr_inpaint(
                 base_color, metallic, roughness, alpha, mask_inv
             )
@@ -5557,11 +5683,18 @@ class Trellis2Engine:
             self.vram_gb = round(props.total_memory / (1024**3), 2)
             self.low_vram = _resolve_low_vram(self._low_vram_setting, self.vram_gb)
 
+            try:
+                import hashlib
+
+                build_tag = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:10]
+            except OSError:
+                build_tag = "unknown"
             log.info(
-                "Detected GPU: %s (%.2f GB VRAM), low_vram=%s",
+                "Detected GPU: %s (%.2f GB VRAM), low_vram=%s (server_build=%s)",
                 self.gpu_name,
                 self.vram_gb,
                 self.low_vram,
+                build_tag,
             )
 
             self.stage = "downloading_or_loading_weights"
@@ -6201,6 +6334,7 @@ class Trellis2Engine:
                         max_rast_faces,
                     )
                     m.simplify(max_rast_faces)
+                    _clean_pre_remesh_mesh(m, torch)
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
