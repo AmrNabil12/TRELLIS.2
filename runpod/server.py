@@ -163,6 +163,7 @@ def _flush_flex_gemm_autotune_cache() -> None:
 
 
 import gc
+import hashlib
 import importlib
 import inspect
 import io
@@ -194,6 +195,8 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[0-9a-f]{32}$")
+MATERIAL_AUDIT_NAME = "material-audit.npz"
 
 log = logging.getLogger("trellis2.server")
 logging.basicConfig(
@@ -4423,7 +4426,8 @@ def _extend_material_atlas(atlas: Any, covered: Any, supported: Any, surface_pos
 
 
 def _project_bake_positions(surface: Any, bvh: Any, vertices: Any, faces: Any,
-                            voxel_size: Any, radius: float, torch: Any) -> Any:
+                            voxel_size: Any, radius: float, torch: Any,
+                            surface_normals: Any = None) -> Any:
     if len(faces) == 0:
         return surface
     projected = torch.empty_like(surface)
@@ -4436,6 +4440,14 @@ def _project_bake_positions(surface: Any, bvh: Any, vertices: Any, faces: Any,
         source = (triangles * weights.unsqueeze(-1)).sum(dim=1)
         distance_sq = ((source - batch) / voxel_size).square().sum(dim=1, keepdim=True)
         nearby = valid_face[:, None] & (distance_sq <= radius**2)
+        if surface_normals is not None:
+            normal = torch.linalg.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+            target = surface_normals[start:start + len(batch)]
+            # The decoded surface can have inconsistent winding. Compare tangent
+            # planes and reject projections across sharply angled boundaries.
+            alignment = (normal * target).sum(dim=1).abs()
+            lengths = normal.norm(dim=1) * target.norm(dim=1)
+            nearby &= ((lengths > 0) & (alignment >= 0.5 * lengths))[:, None]
         projected[start:start + len(batch)] = torch.where(nearby, source, batch)
     return projected
 
@@ -4471,6 +4483,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             mesh_cluster_smooth_strength: float = 1,
             verbose: bool = False,
             use_tqdm: bool = False,
+            material_audit_path: Path | None = None,
         ) -> Any:
             cumesh_local = postprocess_mod.cumesh
             dr_local = postprocess_mod.dr
@@ -4712,9 +4725,15 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             del derivatives
 
             mask = rast[0, ..., 3] > 0
+            surface_face_ids = rast[0, ..., 3][mask].to(t_mod.int32) - 1
             pos = dr_local.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
             valid_pos = pos[mask]
             del pos, rast, uvs_rast, ctx
+            triangles = out_vertices[out_faces]
+            bake_face_normals = t_mod.linalg.cross(
+                triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]
+            )
+            del triangles
 
             n_valid = len(valid_pos)
             radius = 1.0 + remesh_band if remesh else 2.0
@@ -4727,17 +4746,19 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             project_early = use_cuda and (
                 free_gb is None or free_gb < VRAM_SAFETY_FLOOR_GB + sample_bytes / 1024**3
             )
-            def project(positions: Any) -> Any:
+            def project(positions: Any, face_ids: Any) -> Any:
                 nonlocal vertices, faces, bvh
                 if vertices is None:
                     vertices, faces = _to_dev(orig_verts_cpu), _to_dev(orig_faces_cpu)
                 if bvh is None:
                     bvh = cumesh_local.cuBVH(vertices, faces)
-                return _project_bake_positions(positions, bvh, vertices, faces, voxel_size, radius, t_mod)
+                return _project_bake_positions(
+                    positions, bvh, vertices, faces, voxel_size, radius, t_mod, bake_face_normals[face_ids]
+                )
 
             # A previously evicted BVH also needs its own allocation phase.
-            project_early = project_early or bvh is None
-            projected_pos = project(valid_pos) if project_early and n_valid else None
+            project_early = project_early or bvh is None or material_audit_path is not None
+            projected_pos = project(valid_pos, surface_face_ids) if project_early and n_valid else None
             if project_early:
                 bvh = vertices = faces = None
                 _flush_allocator_for_cpp()
@@ -4768,19 +4789,46 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 # projection can land on another sheet at thin material boundaries.
                 sampled = _sample(valid_pos)
                 missing = sampled[:, attr_channels] <= 0
+                source_samples = None
+                if material_audit_path is not None:
+                    # Compare both sample positions on the exact same UVs so
+                    # atlas placement and lighting cannot affect the comparison.
+                    base_slice = attr_layout["base_color"]
+                    direct_rgb = sampled[:, base_slice].float().mul(255).clamp_(0, 255).to(t_mod.uint8).cpu().numpy()
+                    source_samples = _sample(projected_pos)
+                    source_rgb = source_samples[:, base_slice].float().mul(255).clamp_(0, 255).to(t_mod.uint8).cpu().numpy()
+                    direct_valid = (~missing).cpu().numpy()
+                    source_valid = (source_samples[:, attr_channels] > 0).cpu().numpy()
+                    was_projected = (projected_pos != valid_pos).any(dim=1).cpu().numpy()
+                    temporary_audit = material_audit_path.with_suffix(".part")
+                    try:
+                        with temporary_audit.open("wb") as audit_file:
+                            np_mod.savez_compressed(
+                                audit_file, coverage=coverage, direct_rgb=direct_rgb, source_rgb=source_rgb,
+                                direct_valid=direct_valid, source_valid=source_valid, was_projected=was_projected,
+                            )
+                        _atomic_replace(temporary_audit, material_audit_path)
+                    except OSError as exc:
+                        log.warning("Could not save material audit (%s)", exc)
+                    finally:
+                        temporary_audit.unlink(missing_ok=True)
                 missing_rows = missing.nonzero(as_tuple=True)[0]
                 if len(missing_rows):
                     surface = valid_pos[missing_rows]
-                    candidates = projected_pos[missing_rows] if project_early else project(surface)
+                    candidates = (
+                        projected_pos[missing_rows] if project_early else project(surface, surface_face_ids[missing_rows])
+                    )
                     moved = (candidates != surface).any(dim=1)
                     if bool(moved.any()):
-                        sampled[missing_rows[moved]] = _sample(candidates[moved])
+                        rows = missing_rows[moved]
+                        sampled[rows] = source_samples[rows] if source_samples is not None else _sample(candidates[moved])
                 supported = sampled[:, attr_channels] > 0
                 bake_mask[mask] = supported
                 atlas[coverage] = sampled[:, :attr_channels].float().mul(255).clamp_(0, 255).to(t_mod.uint8).cpu().numpy()
                 log.info("Material bake: %d surface hits, %d projection recoveries, %d unsupported",
                          n_valid - int(missing.sum()), int((missing & supported).sum()), int((~supported).sum()))
-                del sampled, missing, missing_rows, supported, features, coords_batch
+                del sampled, missing, missing_rows, supported, features, coords_batch, source_samples
+            del bake_face_normals, surface_face_ids
             del attr_vol_staged, coords_staged, projected_pos, bvh, vertices, faces, orig_verts_cpu, orig_faces_cpu
             _flush_allocator_for_cpp()
 
@@ -5528,8 +5576,6 @@ class Trellis2Engine:
             self.low_vram = _resolve_low_vram(self._low_vram_setting, self.vram_gb)
 
             try:
-                import hashlib
-
                 build_tag = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:10]
             except OSError:
                 build_tag = "unknown"
@@ -6227,6 +6273,9 @@ class Trellis2Engine:
                     gc.collect()
                     self._torch.cuda.empty_cache()
 
+                audit_options = {}
+                if postprocess_patched and os.environ.get("TRELLIS2_MATERIAL_AUDIT") == "1":
+                    audit_options["material_audit_path"] = out_path.with_name(MATERIAL_AUDIT_NAME)
                 glb = self._o_voxel.postprocess.to_glb(
                     vertices=bake_verts,
                     faces=bake_faces,
@@ -6241,6 +6290,7 @@ class Trellis2Engine:
                     remesh_band=params.remesh_band,
                     remesh_project=params.remesh_project,
                     verbose=True,
+                    **audit_options,
                 )
                 del bake_verts, bake_faces, attr_vol, vox_coords
                 log.info("Stage %-26s done in %.2fs", "baking_textures(to_glb)", time.monotonic() - t_bake)
@@ -6327,6 +6377,7 @@ class JobRecord:
     effective_pipeline_type: str | None = None
     glb_path: Path | None = None
     error: str | None = None
+    request_fingerprint: str | None = None
 
     def elapsed_s(self) -> float:
         end = self.finished_at if self.finished_at is not None else time.time()
@@ -6347,7 +6398,7 @@ class JobRecord:
         return round(max(0.0, end - self.created_at), 2)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "job_id": self.job_id,
             "status": self.status,
             "stage": self.stage,
@@ -6358,6 +6409,10 @@ class JobRecord:
             "error": self.error,
             "download_url": f"/jobs/{self.job_id}/glb" if self.status == "completed" else None,
         }
+        if self.status == "completed" and self.glb_path is not None:
+            if self.glb_path.with_name(MATERIAL_AUDIT_NAME).is_file():
+                payload["material_audit_url"] = f"/jobs/{self.job_id}/{MATERIAL_AUDIT_NAME}"
+        return payload
 
 
 def _atomic_replace(src: Path, dst: Path, retries: int = 8) -> None:
@@ -6406,10 +6461,11 @@ class JobManager:
             "stage_started_at": record.stage_started_at,
             "effective_pipeline_type": record.effective_pipeline_type,
             "error": record.error,
+            "request_fingerprint": record.request_fingerprint,
         }
         tmp_path = job_dir / f"status.{uuid.uuid4().hex[:6]}.tmp"
-        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
         try:
+            tmp_path.write_text(json.dumps(payload), encoding="utf-8")
             _atomic_replace(tmp_path, job_dir / "status.json")
         except Exception:
             tmp_path.unlink(missing_ok=True)
@@ -6421,14 +6477,10 @@ class JobManager:
         if not self._jobs_dir.is_dir():
             return None
         try:
-            job_dir: Path | None = None
-            for entry in self._jobs_dir.iterdir():
-                if entry.name == job_id and entry.is_dir():
-                    job_dir = entry
-                    break
-            if job_dir is None:
-                return None
+            job_dir = self._jobs_dir / job_id
             status_file = job_dir / "status.json"
+            if not status_file.is_file():
+                return None
             if not status_file.is_file():
                 return None
             data = json.loads(status_file.read_text(encoding="utf-8"))
@@ -6445,15 +6497,28 @@ class JobManager:
                 effective_pipeline_type=data.get("effective_pipeline_type"),
                 glb_path=job_dir / "mesh.glb",
                 error=data.get("error"),
+                request_fingerprint=data.get("request_fingerprint"),
             )
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
             log.warning("Failed to read job status for %s: %s", job_id, exc)
             return None
 
-    def submit(self, image: Image.Image, params: GenerationParams) -> JobRecord:
-        job_id = uuid.uuid4().hex[:12]
+    def submit(
+        self, image: Image.Image, params: GenerationParams,
+        request_key: str | None = None, fingerprint: str | None = None,
+    ) -> JobRecord:
+        job_id = hashlib.sha256(request_key.encode()).hexdigest()[:12] if request_key else uuid.uuid4().hex[:12]
         job_dir = self._jobs_dir / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
+        self._jobs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            job_dir.mkdir()
+        except FileExistsError:
+            record = self.get(job_id)
+            if record is None:
+                raise HTTPException(status_code=503, detail="An identical submission is being registered. Retry shortly.")
+            if record.request_fingerprint != fingerprint:
+                raise HTTPException(status_code=409, detail="This idempotency key belongs to a different submission.")
+            return record
         out_path = job_dir / "mesh.glb"
         now = time.time()
 
@@ -6472,10 +6537,15 @@ class JobManager:
             stage_started_at=now,
             effective_pipeline_type=params.pipeline_type,
             glb_path=out_path,
+            request_fingerprint=fingerprint,
         )
         with self._lock:
+            try:
+                self._write_status(record)
+            except OSError:
+                job_dir.rmdir()
+                raise
             self._jobs[job_id] = record
-            self._write_status(record)
             self._prune_locked()
 
         self._executor.submit(self._run_job, job_id, image, params, out_path)
@@ -6540,6 +6610,7 @@ class JobManager:
         # Must end in .glb because trimesh.export() infers format from the file extension
         tmp_glb = out_path.parent / ".mesh.tmp.glb"
         try:
+            log.info("Starting GPU job %s", job_id)
             if self._supports_on_stage:
                 self._engine.generate_glb(image, params, tmp_glb, on_stage=_update_stage)
             else:
@@ -6605,6 +6676,8 @@ class JobManager:
             rec = self._jobs.get(child.name) or self._read_status(child.name)
             status_val = rec.status if rec is not None else None
             created = rec.created_at if rec is not None else child.stat().st_mtime
+            if rec is None and time.time() - created < 60:
+                continue
             entries.append((created, child.name, child, status_val))
 
         if len(entries) <= self._max_retained_jobs:
@@ -6746,6 +6819,7 @@ def create_app(
     async def create_job(
         image: UploadFile = File(...),
         params: GenerationParams = Depends(parse_generation_params),
+        idempotency_key: str | None = Header(default=None),
     ) -> dict[str, Any]:
         if resolved_engine.status == "error":
             raise HTTPException(
@@ -6753,8 +6827,16 @@ def create_app(
                 detail=f"TRELLIS.2 failed to initialize: {resolved_engine.error}",
             )
         check_job_gpu(params)
-        pil_image = _decode_uploaded_image(await image.read())
-        record = manager.submit(pil_image, params)
+        if idempotency_key is not None and not _IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+            raise HTTPException(status_code=422, detail="Idempotency-Key must contain 32 lowercase hexadecimal digits.")
+        raw = await image.read()
+        fingerprint = None
+        if idempotency_key is not None:
+            digest = hashlib.sha256(params.model_dump_json().encode())
+            digest.update(b"\0")
+            digest.update(raw)
+            fingerprint = digest.hexdigest()
+        record = manager.submit(_decode_uploaded_image(raw), params, idempotency_key, fingerprint)
         return {
             "job_id": record.job_id,
             "status": record.status,
@@ -6792,6 +6874,15 @@ def create_app(
             media_type="model/gltf-binary",
             filename=f"{job_id}.glb",
         )
+
+    @fastapi_app.get("/jobs/{job_id}/material-audit.npz", dependencies=[Depends(verify_api_key)])
+    def download_material_audit(job_id: str) -> FileResponse:
+        record = manager.get(job_id)
+        if record is not None and record.status == "completed" and record.glb_path is not None:
+            audit = record.glb_path.with_name(MATERIAL_AUDIT_NAME)
+            if audit.is_file():
+                return FileResponse(audit, media_type="application/octet-stream", filename=MATERIAL_AUDIT_NAME)
+        raise HTTPException(status_code=404, detail="No material audit is available for this job.")
 
     @fastapi_app.post("/generate", dependencies=[Depends(verify_api_key)])
     async def generate_sync(

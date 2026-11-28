@@ -1,4 +1,6 @@
 import os
+import tempfile
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -34,6 +36,20 @@ class ExportQualityTests(unittest.TestCase):
         projected = _project_bake_positions(pts, bvh, vertices, faces, 1., 2., torch)
         torch.testing.assert_close(projected[0], pts[0])
         torch.testing.assert_close(projected[1], vertices[0])
+
+    def test_material_projection_rejects_sharp_surface_crossings(self):
+        from runpod.server import _project_bake_positions
+
+        vertices = torch.tensor([[0., 0., 1.], [1., 0., 1.], [0., 1., 1.]])
+        faces = torch.tensor([[0, 1, 2]])
+        points = torch.zeros((3, 3))
+        normals = torch.tensor([[1., 0., 0.], [0., 0., 1.], [0., 0., -1.]])
+        bvh = Mock()
+        bvh.unsigned_distance.return_value = (None, torch.zeros(3, dtype=torch.long),
+                                              torch.tensor([[1., 0., 0.]] * 3))
+        projected = _project_bake_positions(points, bvh, vertices, faces, 1., 2., torch, normals)
+        torch.testing.assert_close(projected[0], points[0])
+        torch.testing.assert_close(projected[1:], vertices[0].expand(2, 3))
 
     def test_missing_material_samples_follow_surface(self):
         import cv2
@@ -150,7 +166,10 @@ class ExportQualityTests(unittest.TestCase):
             sample_counts.append(n_q)
             self.assertTrue(bool((attr_vol[:, 6] == 1).all()))
             out = torch.zeros((1, n_q, 7), dtype=torch.float32, device=grid.device)
-            if n_q == 2:
+            if n_q == 9 and float(grid[0, 1, 0]) > 768.0:
+                out[0, 1:, :3] = 0.95
+                out[0, 1:, 5:] = 1.0
+            elif n_q == 2:
                 self.assertTrue(torch.allclose(grid[..., 0], torch.full((1, 2), 768.25, device=grid.device)))
                 out[0, :, :3] = 0.95
                 out[0, :, 5:] = 1.0
@@ -221,20 +240,24 @@ class ExportQualityTests(unittest.TestCase):
         attrs = torch.ones((2, 6), dtype=torch.float32)
         coords = torch.zeros((2, 3), dtype=torch.int32)
         layout = {"base_color": slice(0, 3), "metallic": slice(3, 4), "roughness": slice(4, 5), "alpha": slice(5, 6)}
-        with patch.object(torch.cuda, "is_available", return_value=False):
-            res_mesh = fake_postprocess.to_glb(
-                vertices=v_in,
-                faces=f_in,
-                attr_volume=attrs,
-                coords=coords,
-                attr_layout=layout,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                grid_size=1536,
-                decimation_target=100,
-                texture_size=8,
-                remesh=True,
-                verbose=False,
-            )
+        def bake(**options):
+            with patch.object(torch.cuda, "is_available", return_value=False):
+                return fake_postprocess.to_glb(
+                    vertices=v_in,
+                    faces=f_in,
+                    attr_volume=attrs,
+                    coords=coords,
+                    attr_layout=layout,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    grid_size=1536,
+                    decimation_target=100,
+                    texture_size=8,
+                    remesh=True,
+                    verbose=False,
+                    **options,
+                )
+
+        res_mesh = bake()
 
         # Preserve open rims and small components through remeshing and UV unwrap.
         simp_idx = calls.index("simplify")
@@ -255,3 +278,13 @@ class ExportQualityTests(unittest.TestCase):
         np.testing.assert_array_equal(roi[0, :2], [[51, 51, 51, 0], [51, 51, 51, 0]])
         np.testing.assert_array_equal(roi[0, 2], [242, 242, 242, 255])
         np.testing.assert_array_equal(roi[1, 0], [242, 242, 242, 255])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            diagnostic = Path(temp_dir) / "material-audit.npz"
+            bake(material_audit_path=diagnostic)
+            with np.load(diagnostic) as audit:
+                self.assertEqual(int(audit["coverage"].sum()), 9)
+                self.assertEqual(int(audit["direct_valid"].sum()), 7)
+                self.assertEqual(int(audit["source_valid"].sum()), 8)
+                self.assertTrue(audit["was_projected"][2])
+                np.testing.assert_array_equal(audit["source_rgb"][2], [242, 242, 242])
