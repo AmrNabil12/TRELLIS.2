@@ -3927,6 +3927,7 @@ def _clean_pre_remesh_mesh(mesh_obj: Any, torch_mod: Any) -> None:
         if _is_oom_like(exc):
             if exc.__traceback__ is not None:
                 traceback.clear_frames(exc.__traceback__)
+            cm = None
             _clear_sticky_cuda_error(torch_mod)
             mesh_obj.vertices = v_bak.to(orig_dev) if orig_dev.type == "cuda" else v_bak
             mesh_obj.faces = f_bak.to(orig_dev) if orig_dev.type == "cuda" else f_bak
@@ -4590,29 +4591,16 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             vertices, faces = _compact_mesh_vertices(vertices, faces, t_mod)
             _flush_allocator_for_cpp()
 
-            mesh = cumesh_local.CuMesh()
-            mesh.init(vertices, faces)
-            try:
+            mesh = None
+            if not remesh:
+                mesh = cumesh_local.CuMesh()
+                mesh.init(vertices, faces)
                 mesh.fill_holes(max_hole_perimeter=3e-2)
-            except Exception as fh_exc:
-                if not _is_oom_like(fh_exc) or not remesh:
-                    raise
-                if fh_exc.__traceback__ is not None:
-                    traceback.clear_frames(fh_exc.__traceback__)
-                _clear_sticky_cuda_error(t_mod)
-                _flush_allocator_for_cpp()
-                log.warning("Skipping CuMesh.fill_holes before remesh after VRAM OOM (%s)", fh_exc)
-            if verbose:
-                print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-            vertices, faces = mesh.read()
+                vertices, faces = mesh.read()
+                if verbose:
+                    print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
             if pbar is not None:
                 pbar.update(1)
-
-            if remesh:
-                # Destroy initial high-face C++ CuMesh buffers before building cuBVH & Dual Contouring
-                del mesh
-                mesh = None
-                _flush_allocator_for_cpp()
 
             if pbar is not None:
                 pbar.set_description("Building BVH")
@@ -4709,34 +4697,27 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                     mesh.simplify(decimation_target, verbose=verbose)
                     if verbose:
                         print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-                    # Clean non-manifold pinches/duplicate/sliver faces created during high-ratio DC simplify
-                    # before uv_unwrap so xatlas charts do not fragment across non-manifold edges.
+                    # Keep the connectivity of the remeshed surface. Splitting
+                    # non-manifold edges creates new boundaries, and capping
+                    # those boundaries can bridge adjacent sheets.
                     if hasattr(mesh, "remove_degenerate_faces"):
                         mesh.remove_degenerate_faces()
                     if hasattr(mesh, "remove_duplicate_faces"):
                         mesh.remove_duplicate_faces()
-                    if hasattr(mesh, "repair_non_manifold_edges"):
-                        mesh.repair_non_manifold_edges()
-                    if hasattr(mesh, "remove_small_connected_components"):
-                        mesh.remove_small_connected_components(1e-5)
-                    _remove_tiny_mesh_components(
-                        mesh,
-                        t_mod,
-                        min_faces=max(12, min(96, int(decimation_target) // 20_000)),
-                        max_rel_area=2e-4,
-                    )
                     if hasattr(mesh, "fill_holes"):
+                        faces_before_fill = mesh.num_faces
+                        # This pass is for pinholes left by decimation. Scale
+                        # its perimeter limit with the actual remesh grid.
                         try:
-                            mesh.fill_holes(max_hole_perimeter=5e-2)
+                            mesh.fill_holes(max_hole_perimeter=12 * scale / dc_res)
                         except Exception as fh_exc:
-                            if _is_cuda_oom_msg(fh_exc):
-                                _flush_allocator_for_cpp()
-                                log.warning("Skipping CuMesh.fill_holes after simplify due to VRAM OOM (%s)", fh_exc)
-                            else:
+                            if not _is_oom_like(fh_exc):
                                 raise
+                            _clear_sticky_cuda_error(t_mod)
+                            _flush_allocator_for_cpp()
+                            log.warning("Skipping post-decimation pinhole fill after VRAM OOM (%s)", fh_exc)
                         else:
-                            if hasattr(mesh, "remove_degenerate_faces"):
-                                mesh.remove_degenerate_faces()
+                            log.info("Post-decimation pinhole fill added %d faces", mesh.num_faces - faces_before_fill)
                 except Exception as remesh_exc:
                     if remesh_exc.__traceback__ is not None:
                         traceback.clear_frames(remesh_exc.__traceback__)
@@ -4803,7 +4784,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 )
                 mask_chunk = rast_chunk[..., 3:4] > 0
                 rast_chunk[..., 3:4] += i
-                rast = t_mod.where(mask_chunk, rast_chunk, rast)
+                t_mod.where(mask_chunk, rast_chunk, rast, out=rast)
                 del rast_chunk, mask_chunk
 
             mask = rast[0, ..., 3] > 0
@@ -4820,91 +4801,55 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
 
             n_valid = int(valid_pos.shape[0])
             proj_step = 4_000_000
-            if n_valid <= proj_step:
-                _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
-                orig_tri_verts = vertices[faces[face_id.long()]]
-                valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-                del face_id, uvw, orig_tri_verts
-            else:
-                projected_pos = t_mod.empty_like(valid_pos)
-                for s in range(0, n_valid, proj_step):
-                    e = min(n_valid, s + proj_step)
-                    _, face_id, uvw = bvh.unsigned_distance(valid_pos[s:e], return_uvw=True)
-                    orig_tri_verts = vertices[faces[face_id.long()]]
-                    projected_pos[s:e] = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-                    del face_id, uvw, orig_tri_verts
-                valid_pos = projected_pos
-                del projected_pos
+            projected_pos = t_mod.empty_like(valid_pos)
+            max_projection_voxels = 1.0 + remesh_band if remesh else 2.0
+            for start in range(0, n_valid, proj_step):
+                surface = valid_pos[start : start + proj_step]
+                _, face_id, uvw = bvh.unsigned_distance(surface, return_uvw=True)
+                source = (vertices[faces[face_id.long()]] * uvw.unsqueeze(-1)).sum(dim=1)
+                delta = (source - surface) / voxel_size
+                use_source = delta.square().sum(dim=1, keepdim=True) <= max_projection_voxels**2
+                projected_pos[start : start + proj_step] = t_mod.where(use_source, source, surface)
+                del surface, face_id, uvw, source, delta, use_source
 
             # Free cuBVH + pre-remesh Dual-Grid mesh BEFORE moving PBR voxel volume onto GPU
             del bvh, vertices, faces
             _flush_allocator_for_cpp()
 
-            attr_vol_dev = _to_dev(attr_vol_staged)
-            coords_dev = _to_dev(coords_staged)
-            del attr_vol_staged, coords_staged
-
             attrs = t_mod.zeros(
-                texture_size, texture_size, attr_channels, device=target_dev, dtype=attr_vol_dev.dtype
+                texture_size, texture_size, attr_channels, device=target_dev, dtype=attr_vol_staged.dtype
             )
+            bake_mask = mask.clone()
             if n_valid > 0:
-                grid_coords = (valid_pos - aabb[0]) / voxel_size
-                coords_batch = t_mod.cat([t_mod.zeros_like(coords_dev[:, :1]), coords_dev], dim=-1)
-                vol_shape = t_mod.Size([1, attr_channels, *grid_size.tolist()])
-                sampled = grid_sample_fn(
-                    attr_vol_dev,
-                    coords_batch,
-                    shape=vol_shape,
-                    grid=grid_coords.reshape(1, -1, 3),
-                    mode="trilinear",
+                # A real sample can have zero alpha. Interpolate a constant
+                # channel alongside the material to detect sparse-grid misses.
+                features = attr_vol_staged.new_empty(
+                    (attr_vol_staged.shape[0], attr_channels + 1), device=target_dev
                 )
-                sampled_flat = sampled[0] if (sampled.ndim == 3 and int(sampled.shape[0]) == 1) else sampled
-                # Recover rare empty-voxel misses (<1 voxel drift from surface simplification) symmetrically by shell radius
-                alpha_slice = attr_layout.get("alpha")
-                if alpha_slice is not None and sampled_flat.ndim == 2 and int(sampled_flat.shape[0]) == n_valid:
-                    best_a = sampled_flat[..., alpha_slice].amax(dim=-1)
-                    miss_mask = best_a <= 1e-3
-                    if bool(miss_mask.any()) and not bool(miss_mask.all()):
-                        sampled_flat = sampled_flat.clone()
-                        cur_idx = t_mod.nonzero(miss_mask, as_tuple=False).squeeze(-1)
-                        for step_r in (0.45, 0.85):
-                            if int(cur_idx.numel()) == 0:
-                                break
-                            cur_grid = grid_coords[cur_idx]
-                            val_sum = t_mod.zeros((int(cur_idx.numel()), attr_channels), dtype=sampled_flat.dtype, device=sampled_flat.device)
-                            w_sum = t_mod.zeros((int(cur_idx.numel()),), dtype=sampled_flat.dtype, device=sampled_flat.device)
-                            for delta in (
-                                (step_r, 0.0, 0.0),
-                                (-step_r, 0.0, 0.0),
-                                (0.0, step_r, 0.0),
-                                (0.0, -step_r, 0.0),
-                                (0.0, 0.0, step_r),
-                                (0.0, 0.0, -step_r),
-                            ):
-                                d_vec = t_mod.tensor(delta, dtype=cur_grid.dtype, device=cur_grid.device)
-                                probe = grid_sample_fn(
-                                    attr_vol_dev,
-                                    coords_batch,
-                                    shape=vol_shape,
-                                    grid=(cur_grid + d_vec).reshape(1, -1, 3),
-                                    mode="trilinear",
-                                )
-                                probe_flat = probe[0] if (probe.ndim == 3 and int(probe.shape[0]) == 1) else probe
-                                probe_a = probe_flat[..., alpha_slice].amax(dim=-1)
-                                hit = probe_a > 1e-3
-                                if bool(hit.any()):
-                                    w = t_mod.where(hit, probe_a, t_mod.zeros_like(probe_a))
-                                    val_sum.addcmul_(probe_flat, w.unsqueeze(-1))
-                                    w_sum.add_(w)
-                            recovered = w_sum > 1e-3
-                            if bool(recovered.any()):
-                                rec_idx = cur_idx[recovered]
-                                sampled_flat[rec_idx] = val_sum[recovered] / w_sum[recovered].unsqueeze(-1)
-                            cur_idx = cur_idx[~recovered]
-                        del cur_idx
-                attrs[mask] = sampled_flat
-                del grid_coords, coords_batch, sampled, sampled_flat
-            del attr_vol_dev, coords_dev, valid_pos
+                features[:, :attr_channels].copy_(attr_vol_staged)
+                features[:, attr_channels].fill_(1)
+                coords_batch = coords_staged.new_empty((coords_staged.shape[0], 4), device=target_dev)
+                coords_batch[:, 0].zero_()
+                coords_batch[:, 1:].copy_(coords_staged)
+                vol_shape = t_mod.Size([1, attr_channels + 1, *grid_size.tolist()])
+
+                def _sample(positions: Any) -> Any:
+                    grid = ((positions - aabb[0]) / voxel_size).reshape(1, -1, 3)
+                    return grid_sample_fn(features, coords_batch, shape=vol_shape, grid=grid).reshape(
+                        -1, attr_channels + 1
+                    )
+
+                sampled = _sample(projected_pos)
+                missing = sampled[:, attr_channels] <= 0
+                # Retry using the actual exported surface only where projection
+                # changed the position. Axis sweeps can sample another layer.
+                retry = missing & (projected_pos != valid_pos).any(dim=1)
+                if bool(retry.any()):
+                    sampled[retry] = _sample(valid_pos[retry])
+                bake_mask[mask] = sampled[:, attr_channels] > 0
+                attrs[mask] = sampled[:, :attr_channels]
+                del sampled, missing, retry, features, coords_batch
+            del attr_vol_staged, coords_staged, valid_pos, projected_pos
             _flush_allocator_for_cpp()
 
             if pbar is not None:
@@ -4917,8 +4862,11 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             if verbose:
                 print("Finalizing mesh...", end="", flush=True)
 
-            mask_np = mask.cpu().numpy()
-            del mask
+            mask_inv = (~bake_mask).cpu().numpy().astype(np_mod.uint8)
+            if verbose:
+                missing_count = int(mask_inv.sum()) - (texture_size**2 - n_valid)
+                log.info("UV bake left %d of %d covered texels without voxel support", missing_count, n_valid)
+            del mask, bake_mask
 
             base_color = np_mod.clip(attrs[..., attr_layout["base_color"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
             metallic = np_mod.clip(attrs[..., attr_layout["metallic"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
@@ -4927,13 +4875,6 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             del attrs
             alpha_mode = "OPAQUE"
 
-            mask_inv = (~mask_np).astype(np_mod.uint8)
-            if bool((mask_np & (alpha[..., 0] >= 8)).any()):
-                miss_uv = (mask_np & (alpha[..., 0] < 8)).astype(np_mod.uint8)
-                mask_inv = np_mod.maximum(mask_inv, miss_uv)
-                valid_al = alpha[mask_inv == 0, 0]
-                if alpha_mode == "OPAQUE" and valid_al.size > 0 and int(valid_al.min()) >= 240:
-                    alpha[..., 0] = 255
             base_color, metallic, roughness, alpha = _parallel_pbr_inpaint(
                 base_color, metallic, roughness, alpha, mask_inv
             )
@@ -6253,134 +6194,46 @@ class Trellis2Engine:
             is_oversized_mesh = int(getattr(getattr(m, "faces", None), "shape", (0,))[0]) > max_rast_faces
             tex_dec = pipe.models.get("tex_slat_decoder")
             defer_tex_load = bool(tight_gpu or res > 1024 or is_oversized_mesh)
+            if mgr is not None and defer_tex_load:
+                mgr.evict_except([], clear_cache=True)
+            if is_oversized_mesh:
+                log.info(
+                    "Simplifying oversized raw mesh from %d toward %d faces",
+                    int(m.faces.shape[0]),
+                    max_rast_faces,
+                )
+                m.simplify(max_rast_faces)
+                _clean_pre_remesh_mesh(m, torch)
+                log.info("Prepared export source with %d faces", int(m.faces.shape[0]))
+
+            free_after_shape = _cuda_free_gb(torch)
+            spill_mesh_geom = bool(
+                mgr is None or defer_tex_load or free_after_shape is None or free_after_shape < floor + 5.0
+            )
+            verts_staged = m.vertices.cpu() if spill_mesh_geom else m.vertices
+            faces_staged = m.faces.cpu() if spill_mesh_geom else m.faces
+            del m
+            if spill_mesh_geom:
+                self._release_vram(offload_models=False)
             if mgr is not None:
-                if defer_tex_load:
-                    # Free ALL neural models & PyTorch cached blocks before raw-cudaMalloc CuMesh calls
-                    mgr.evict_except([], clear_cache=True)
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                else:
-                    # Stage tex_slat_decoder before deciding whether to overlap CuMesh.fill_holes()
-                    mgr.ensure_on_gpu(
-                        ["tex_slat_decoder"],
-                        pipe.device,
-                        required_free_gb=floor + 3.5,
-                    )
-                    self._configure_decoder_residency(tex_dec)
+                mgr.ensure_on_gpu(
+                    ["tex_slat_decoder"],
+                    pipe.device,
+                    required_free_gb=floor + (6.0 if res > 1024 else 3.5),
+                )
+                self._configure_decoder_residency(tex_dec)
             elif tex_dec is not None:
                 tex_dec.low_vram = True
 
-            free_after_shape = _cuda_free_gb(torch)
-            overlap_min_free = floor + (8.0 if res > 1024 else 5.0)
-            can_overlap_fill = bool(
-                mgr is not None
-                and not defer_tex_load
-                and torch is not None
-                and torch.cuda.is_available()
-                and hasattr(torch.cuda, "Stream")
-                and hasattr(torch.cuda, "Event")
-                and free_after_shape is not None
-                and free_after_shape >= overlap_min_free
-            )
-            fill_thread: threading.Thread | None = None
-            fill_stream: Any = None
-            fill_err: list[BaseException | None] = [None]
-            verts_staged: Any = None
-            faces_staged: Any = None
-            spill_mesh_geom = False
-
-            def _run_fill_holes_safe(mesh_obj: Any) -> None:
-                try:
-                    mesh_obj.fill_holes()
-                except Exception as fh_exc:
-                    if not _is_oom_like(fh_exc):
-                        raise
-                    if fh_exc.__traceback__ is not None:
-                        traceback.clear_frames(fh_exc.__traceback__)
-                    _clear_sticky_cuda_error(torch)
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    log.warning(
-                        "Deferring CuMesh.fill_holes to postprocess.to_glb after VRAM OOM (%s)",
-                        fh_exc,
-                    )
-
-            if can_overlap_fill:
-                shape_done_evt = torch.cuda.Event()
-                shape_done_evt.record(torch.cuda.current_stream())
-                fill_stream = torch.cuda.Stream()
-
-                def _fill_holes_async() -> None:
-                    try:
-                        with torch.cuda.stream(fill_stream):
-                            fill_stream.wait_event(shape_done_evt)
-                            m.fill_holes()
-                    except BaseException as exc:
-                        fill_err[0] = exc
-
-                fill_thread = threading.Thread(
-                    target=_fill_holes_async, name="trellis2-fill-holes", daemon=True
-                )
-                fill_thread.start()
-            else:
-                if is_oversized_mesh:
-                    # Skip OOM-prone fill_holes on >16.77M-face raw dual-grid meshes; simplify to the
-                    # nvdiffrast cap first so fill_holes runs fast on <=16.77M faces with ~20+ GiB free.
-                    log.info(
-                        "Simplifying oversized raw mesh (%d > %d faces) before CuMesh.fill_holes",
-                        int(m.faces.shape[0]),
-                        max_rast_faces,
-                    )
-                    m.simplify(max_rast_faces)
-                    _clean_pre_remesh_mesh(m, torch)
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                _run_fill_holes_safe(m)
-                free_after_shape = _cuda_free_gb(torch)
-                spill_mesh_geom = bool(
-                    mgr is None
-                    or defer_tex_load
-                    or free_after_shape is None
-                    or free_after_shape < (floor + 5.0)
-                )
-                verts_staged = m.vertices.cpu() if spill_mesh_geom else m.vertices
-                faces_staged = m.faces.cpu() if spill_mesh_geom else m.faces
-                del m
-                if mgr is None or spill_mesh_geom:
-                    self._release_vram(offload_models=False)
-                if defer_tex_load and mgr is not None:
-                    mgr.ensure_on_gpu(
-                        ["tex_slat_decoder"],
-                        pipe.device,
-                        required_free_gb=floor + (6.0 if res > 1024 else 3.5),
-                    )
-                    self._configure_decoder_residency(tex_dec)
-
             _emit("decoding_textures")
             t_st = time.monotonic()
-            try:
-                tex_slat_gpu = tex_slat_staged.to(pipe.device) if spill_tex_slat else tex_slat_staged
-                del tex_slat_staged
-                tex_voxels = pipe.decode_tex_slat(tex_slat_gpu, subs)
-                del tex_slat_gpu, subs
-                if mgr is None:
-                    self._release_vram(offload_models=True)
-            finally:
-                if fill_thread is not None:
-                    fill_thread.join()
-                    if fill_stream is not None:
-                        torch.cuda.current_stream().wait_stream(fill_stream)
-                    if fill_err[0] is not None:
-                        raise fill_err[0]
+            tex_slat_gpu = tex_slat_staged.to(pipe.device) if spill_tex_slat else tex_slat_staged
+            del tex_slat_staged
+            tex_voxels = pipe.decode_tex_slat(tex_slat_gpu, subs)
+            del tex_slat_gpu, subs
+            if mgr is None:
+                self._release_vram(offload_models=True)
             _log_stage(f"decode_tex_slat({res})", t_st)
-
-            if can_overlap_fill:
-                verts_staged = m.vertices
-                faces_staged = m.faces
-                del m
 
             v = tex_voxels[0]
             del tex_voxels
@@ -6500,11 +6353,9 @@ class Trellis2Engine:
                 postprocess_patched = bool(
                     getattr(getattr(self._o_voxel, "postprocess", None), "_trellis2_postprocess_patched", False)
                 )
-                stage_bake_cpu = bool(
-                    use_cuda
-                    and postprocess_patched
-                    and (self.low_vram or self.vram_gb is None or self.vram_gb < 32.0)
-                )
+                # The patched exporter builds geometry/BVH before it needs
+                # the material volume. Keep the caller's copies off GPU.
+                stage_bake_cpu = use_cuda and postprocess_patched
                 bake_verts = mesh.vertices
                 bake_faces = mesh.faces
                 bake_layout = mesh.layout
