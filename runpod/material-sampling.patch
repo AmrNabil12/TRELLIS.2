@@ -60,6 +60,23 @@
      # --- Texture Post-Processing & Material Construction ---
      if use_tqdm:
          pbar.set_description("Finalizing mesh")
+@@ -284,2 +318,12 @@
+     alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
++    from opaque_material import pad_material_edges, recover_opaque_samples
++    triangles = out_vertices[out_faces.long()]
++    normals = torch.nn.functional.normalize(torch.linalg.cross(
++        triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), dim=1)
++    face_ids = (rast[0, ..., 3].int() - 1).clamp_min(0)
++    repaired = recover_opaque_samples(
++        (base_color, metallic, roughness, alpha), mask, pos.cpu().numpy(),
++        face_ids.cpu().numpy(), normals.cpu().numpy(), voxel_size.max().item())
++    if verbose:
++        print(f"Recovered {repaired} low-opacity material samples on opaque surfaces")
+     alpha_mode = 'OPAQUE'
+@@ -295,2 +339,3 @@
+     # Standard PBR packs Metallic and Roughness into Blue and Green channels
++    pad_material_edges((base_color, metallic, roughness, alpha), mask)
+     material = trimesh.visual.material.PBRMaterial(
 --- a/trellis2/pipelines/trellis2_image_to_3d.py
 +++ b/trellis2/pipelines/trellis2_image_to_3d.py
 @@ -469,6 +469,9 @@

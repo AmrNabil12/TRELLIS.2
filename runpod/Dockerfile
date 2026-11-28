@@ -109,7 +109,7 @@ RUN git clone --recursive -b "${TRELLIS2_BRANCH}" "${TRELLIS2_REPO}" /opt/TRELLI
 RUN python -c "import fastapi, uvicorn, trimesh, cv2, PIL; from transformers import DINOv3ViTModel"
 
 WORKDIR /app
-COPY server.py download_weights.py start.sh /app/
+COPY server.py opaque_material.py download_weights.py start.sh /app/
 RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 
 ENV PYTHONPATH=/opt/TRELLIS.2:/app \
