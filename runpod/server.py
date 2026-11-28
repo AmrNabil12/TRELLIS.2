@@ -4048,76 +4048,6 @@ def patch_mesh_simplify_noop(mesh_cls: Any, torch_mod: Any = None, cumesh_mod: A
     mesh_cls._trellis2_simplify_patched = True
 
 
-def gpu_dilate_uv_gutters(
-    base_color: Any,
-    metallic: Any,
-    roughness: Any,
-    alpha: Any,
-    mask_inv: Any,
-    torch_mod: Any,
-    f_mod: Any,
-    device: Any = None,
-    num_iters: int = 8,
-) -> tuple[Any, Any, Any, Any]:
-    """Dilate UV island borders into empty UV gutters on GPU (<5ms) while keeping 100% of valid texels bit-exact."""
-    import numpy as np
-
-    dev = device if device is not None else ("cuda" if torch_mod.cuda.is_available() else "cpu")
-    h, w = mask_inv.shape[:2]
-
-    def _as_hwc(arr: Any, ch: int) -> Any:
-        if arr.ndim == 2:
-            return arr[..., None]
-        if arr.ndim == 3 and arr.shape[2] == ch:
-            return arr
-        return arr.reshape(h, w, ch)
-
-    bc_hwc = _as_hwc(base_color, 3)
-    mt_hwc = _as_hwc(metallic, 1)
-    rg_hwc = _as_hwc(roughness, 1)
-    al_hwc = _as_hwc(alpha, 1)
-
-    packed_np = np.concatenate([bc_hwc, mt_hwc, rg_hwc, al_hwc], axis=-1)  # (H, W, 6) uint8
-    orig_u8 = torch_mod.from_numpy(packed_np).to(device=dev, non_blocking=True)
-    valid_orig = (torch_mod.from_numpy(mask_inv).to(device=dev, non_blocking=True) == 0)
-
-    if not bool(valid_orig.any()):
-        return bc_hwc.copy(), mt_hwc.copy(), rg_hwc.copy(), al_hwc.copy()
-
-    # Check if alpha is uniform across all valid UV island pixels (e.g. opaque 255)
-    al_valid = orig_u8[..., 5][valid_orig]
-    al_min = al_valid.min()
-    al_uniform = bool((al_min == al_valid.max()).item())
-
-    buf = orig_u8.permute(2, 0, 1).unsqueeze(0).to(torch_mod.float32)  # (1, 6, H, W)
-    valid = valid_orig.unsqueeze(0).unsqueeze(0).to(torch_mod.float32)  # (1, 1, H, W)
-    buf.mul_(valid)
-
-    for _ in range(max(1, int(num_iters))):
-        nbr_valid = f_mod.avg_pool2d(valid, kernel_size=3, stride=1, padding=1, count_include_pad=False)
-        need_fill = (valid == 0) & (nbr_valid > 0)
-        if not bool(need_fill.any()):
-            break
-        nbr_sum = f_mod.avg_pool2d(buf, kernel_size=3, stride=1, padding=1, count_include_pad=False)
-        filled = nbr_sum / nbr_valid.clamp_min(1e-6)
-        buf = torch_mod.where(need_fill, filled, buf)
-        valid = torch_mod.where(need_fill, torch_mod.ones_like(valid), valid)
-
-    out_u8 = buf.squeeze(0).permute(1, 2, 0).round().clamp_(0, 255).to(torch_mod.uint8)
-    # Guarantee 100% bit-exact preservation of every valid UV island pixel
-    out_u8 = torch_mod.where(valid_orig.unsqueeze(-1), orig_u8, out_u8)
-    if al_uniform:
-        out_u8[..., 5].fill_(int(al_min.item()))
-
-    out_np = out_u8.cpu().numpy()
-    return (
-        np.ascontiguousarray(out_np[..., 0:3]),
-        np.ascontiguousarray(out_np[..., 3:4]),
-        np.ascontiguousarray(out_np[..., 4:5]),
-        np.ascontiguousarray(out_np[..., 5:6]),
-    )
-
-
 def _prefer_quad_diagonal_02(points: Any, torch_mod: Any) -> Any:
     """Choose the consistently wound split, breaking planar ties by diagonal length."""
     a, b, c, d = points.unbind(dim=1)
@@ -4445,58 +4375,78 @@ def patch_cumesh_remeshing(remeshing_mod: Any, torch_mod: Any = None) -> None:
     remeshing_mod._trellis2_remesh_patched = True
 
 
+def _extend_material_atlas(atlas: Any, covered: Any, supported: Any, surface_positions: Any, cv2: Any, np: Any) -> Any:
+    """Copy complete PBR samples into holes and gutters without mixing channels."""
+    if covered.any() and not supported.any():
+        raise ValueError("No covered texels sampled the decoded material volume")
+    if supported.all() or not covered.any():
+        return atlas
+
+    def nearest_samples(pixels: Any, donors: Any) -> Any:
+        distances, labels = cv2.distanceTransformWithLabels(
+            (~donors).astype(np.uint8), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
+        )
+        del distances
+        palette = np.zeros((int(labels.max()) + 1, pixels.shape[-1]), dtype=pixels.dtype)
+        palette[labels[donors]] = pixels[donors]
+        return palette[labels]
+
+    missing = covered & ~supported
+    if missing.any():
+        # Restrict donors to the same connected UV footprint wherever it has
+        # at least one observed texel. Adjacent islands may be different materials.
+        observed = supported[covered]
+        _, islands, boxes, _ = cv2.connectedComponentsWithStats(covered.astype(np.uint8), connectivity=4)
+        for label in np.unique(islands[missing]):
+            x, y, w, h = boxes[label, :4]
+            region = np.s_[y:y+h, x:x+w]
+            island = islands[region] == label
+            donors = island & supported[region]
+            if donors.any():
+                targets = island & missing[region]
+                local = atlas[region]
+                local[targets] = nearest_samples(local, donors)[targets]
+                supported[region] |= targets
+        del islands
+        unresolved = covered & ~supported
+        if unresolved.any():
+            # An entire footprint can miss the volume. UV distance across a
+            # seam is arbitrary, so find donors on the surface in model space.
+            from scipy.spatial import cKDTree
+
+            xyz = surface_positions.detach().cpu().numpy()
+            tree = cKDTree(xyz[observed])
+            _, indices = tree.query(xyz[unresolved[covered]])
+            atlas[unresolved] = atlas[covered][observed][indices]
+            supported[unresolved] = True
+    return nearest_samples(atlas, supported)
+
+
+def _project_bake_positions(surface: Any, bvh: Any, vertices: Any, faces: Any,
+                            voxel_size: Any, radius: float, torch: Any) -> Any:
+    if len(faces) == 0:
+        return surface
+    projected = torch.empty_like(surface)
+    for start in range(0, len(surface), 1_000_000):
+        batch = surface[start:start + 1_000_000]
+        _, face_ids, weights = bvh.unsigned_distance(batch, return_uvw=True)
+        face_ids = face_ids.long().reshape(-1)
+        valid_face = (face_ids >= 0) & (face_ids < len(faces))
+        triangles = vertices[faces[face_ids.clamp(0, len(faces) - 1)]]
+        source = (triangles * weights.unsqueeze(-1)).sum(dim=1)
+        distance_sq = ((source - batch) / voxel_size).square().sum(dim=1, keepdim=True)
+        nearby = valid_face[:, None] & (distance_sq <= radius**2)
+        projected[start:start + len(batch)] = torch.where(nearby, source, batch)
+    return projected
+
+
 def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> None:
-    """Optimize o_voxel.postprocess.to_glb for 24 GB VRAM at 1536^3/4K + <5ms GPU UV-gutter dilation."""
+    """Install the shared geometry and material exporter."""
     if postprocess_mod is None or getattr(postprocess_mod, "_trellis2_postprocess_patched", False):
         return
-    try:
-        src = inspect.getsource(postprocess_mod.to_glb)
-    except Exception:
-        src = ""
-
-    old_inpaint_block = (
-        "    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)\n"
-        "    metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]\n"
-        "    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]\n"
-        "    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]"
-    )
-
-    inpaint_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="trellis2-inpaint")
-
-    def _parallel_pbr_inpaint(
-        base_color: Any, metallic: Any, roughness: Any, alpha: Any, mask_inv: Any
-    ) -> tuple[Any, Any, Any, Any]:
-        t_local = torch_mod if torch_mod is not None else getattr(postprocess_mod, "torch", None)
-        if t_local is not None and t_local.cuda.is_available():
-            try:
-                import torch.nn.functional as f_mod
-
-                return gpu_dilate_uv_gutters(
-                    base_color, metallic, roughness, alpha, mask_inv, t_local, f_mod
-                )
-            except Exception as exc:
-                log.debug("GPU UV-gutter dilation failed; falling back to 4-thread cv2.inpaint: %s", exc)
-
-        cv2_local = postprocess_mod.cv2
-        flag = cv2_local.INPAINT_TELEA
-        f_bc = inpaint_pool.submit(cv2_local.inpaint, base_color, mask_inv, 3, flag)
-        f_mt = inpaint_pool.submit(cv2_local.inpaint, metallic, mask_inv, 1, flag)
-        f_rg = inpaint_pool.submit(cv2_local.inpaint, roughness, mask_inv, 1, flag)
-        f_al = inpaint_pool.submit(cv2_local.inpaint, alpha, mask_inv, 1, flag)
-        return (
-            f_bc.result(),
-            f_mt.result()[..., None],
-            f_rg.result()[..., None],
-            f_al.result()[..., None],
-        )
-
-    is_full_to_glb = (
-        hasattr(postprocess_mod, "cumesh")
-        and hasattr(postprocess_mod, "dr")
-        and hasattr(postprocess_mod, "grid_sample_3d")
-        and hasattr(postprocess_mod, "trimesh")
-        and ("remesh_narrow_band_dc" in src or src == "")
-    )
+    is_full_to_glb = all(hasattr(postprocess_mod, name) for name in (
+        "to_glb", "cumesh", "dr", "grid_sample_3d", "trimesh", "np", "Image", "cv2", "tqdm"
+    ))
     if is_full_to_glb:
         t_mod = torch_mod if torch_mod is not None else postprocess_mod.torch
         np_mod = postprocess_mod.np
@@ -4766,33 +4716,34 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             valid_pos = pos[mask]
             del pos, rast, uvs_rast, ctx
 
-            if vertices is None:
-                vertices = _to_dev(orig_verts_cpu)
-                faces = _to_dev(orig_faces_cpu)
-            if bvh is None:
-                bvh = cumesh_local.cuBVH(vertices, faces)
-            del orig_verts_cpu, orig_faces_cpu
-
-            n_valid = int(valid_pos.shape[0])
-            proj_step = 4_000_000
-            projected_pos = t_mod.empty_like(valid_pos)
-            max_projection_voxels = 1.0 + remesh_band if remesh else 2.0
-            for start in range(0, n_valid, proj_step):
-                surface = valid_pos[start : start + proj_step]
-                _, face_id, uvw = bvh.unsigned_distance(surface, return_uvw=True)
-                source = (vertices[faces[face_id.long()]] * uvw.unsqueeze(-1)).sum(dim=1)
-                delta = (source - surface) / voxel_size
-                use_source = delta.square().sum(dim=1, keepdim=True) <= max_projection_voxels**2
-                projected_pos[start : start + proj_step] = t_mod.where(use_source, source, surface)
-                del surface, face_id, uvw, source, delta, use_source
-
-            # Free cuBVH + pre-remesh Dual-Grid mesh BEFORE moving PBR voxel volume onto GPU
-            del bvh, vertices, faces
-            _flush_allocator_for_cpp()
-
-            attrs = t_mod.zeros(
-                texture_size, texture_size, attr_channels, device=target_dev, dtype=attr_vol_staged.dtype
+            n_valid = len(valid_pos)
+            radius = 1.0 + remesh_band if remesh else 2.0
+            # Budget the material features, batched coordinates, sampler hash
+            # table, and eight neighbor indices/weights per query before allowing
+            # sparse sampling to overlap a resident source BVH.
+            sample_bytes = len(coords_staged) * (32 + (attr_channels + 1) * attr_vol_staged.element_size())
+            sample_bytes += n_valid * (64 + 4 * (attr_channels + 1))
+            free_gb = _cuda_free_gb(t_mod) if use_cuda else None
+            project_early = use_cuda and (
+                free_gb is None or free_gb < VRAM_SAFETY_FLOOR_GB + sample_bytes / 1024**3
             )
+            def project(positions: Any) -> Any:
+                nonlocal vertices, faces, bvh
+                if vertices is None:
+                    vertices, faces = _to_dev(orig_verts_cpu), _to_dev(orig_faces_cpu)
+                if bvh is None:
+                    bvh = cumesh_local.cuBVH(vertices, faces)
+                return _project_bake_positions(positions, bvh, vertices, faces, voxel_size, radius, t_mod)
+
+            # A previously evicted BVH also needs its own allocation phase.
+            project_early = project_early or bvh is None
+            projected_pos = project(valid_pos) if project_early and n_valid else None
+            if project_early:
+                bvh = vertices = faces = None
+                _flush_allocator_for_cpp()
+
+            atlas = np_mod.zeros((texture_size, texture_size, attr_channels), dtype=np_mod.uint8)
+            coverage = mask.cpu().numpy()
             bake_mask = mask.clone()
             if n_valid > 0:
                 # A real sample can have zero alpha. Interpolate a constant
@@ -4817,16 +4768,20 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 # projection can land on another sheet at thin material boundaries.
                 sampled = _sample(valid_pos)
                 missing = sampled[:, attr_channels] <= 0
-                retry = missing & (projected_pos != valid_pos).any(dim=1)
-                if bool(retry.any()):
-                    sampled[retry] = _sample(projected_pos[retry])
+                missing_rows = missing.nonzero(as_tuple=True)[0]
+                if len(missing_rows):
+                    surface = valid_pos[missing_rows]
+                    candidates = projected_pos[missing_rows] if project_early else project(surface)
+                    moved = (candidates != surface).any(dim=1)
+                    if bool(moved.any()):
+                        sampled[missing_rows[moved]] = _sample(candidates[moved])
                 supported = sampled[:, attr_channels] > 0
                 bake_mask[mask] = supported
-                attrs[mask] = sampled[:, :attr_channels]
+                atlas[coverage] = sampled[:, :attr_channels].float().mul(255).clamp_(0, 255).to(t_mod.uint8).cpu().numpy()
                 log.info("Material bake: %d surface hits, %d projection recoveries, %d unsupported",
                          n_valid - int(missing.sum()), int((missing & supported).sum()), int((~supported).sum()))
-                del sampled, missing, retry, supported, features, coords_batch
-            del attr_vol_staged, coords_staged, valid_pos, projected_pos
+                del sampled, missing, missing_rows, supported, features, coords_batch
+            del attr_vol_staged, coords_staged, projected_pos, bvh, vertices, faces, orig_verts_cpu, orig_faces_cpu
             _flush_allocator_for_cpp()
 
             if pbar is not None:
@@ -4839,22 +4794,12 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             if verbose:
                 print("Finalizing mesh...", end="", flush=True)
 
-            mask_inv = (~bake_mask).cpu().numpy().astype(np_mod.uint8)
-            if verbose:
-                missing_count = int(mask_inv.sum()) - (texture_size**2 - n_valid)
-                log.info("UV bake left %d of %d covered texels without voxel support", missing_count, n_valid)
-            del mask, bake_mask
-
-            base_color = np_mod.clip(attrs[..., attr_layout["base_color"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
-            metallic = np_mod.clip(attrs[..., attr_layout["metallic"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
-            roughness = np_mod.clip(attrs[..., attr_layout["roughness"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
-            alpha = np_mod.clip(attrs[..., attr_layout["alpha"]].float().cpu().numpy() * 255, 0, 255).astype(np_mod.uint8)
-            del attrs
-            alpha_mode = "OPAQUE"
-
-            base_color, metallic, roughness, alpha = _parallel_pbr_inpaint(
-                base_color, metallic, roughness, alpha, mask_inv
-            )
+            atlas = _extend_material_atlas(atlas, coverage, bake_mask.cpu().numpy(), valid_pos, postprocess_mod.cv2, np_mod)
+            del mask, bake_mask, coverage, valid_pos
+            base_color = atlas[..., attr_layout["base_color"]]
+            metallic = atlas[..., attr_layout["metallic"]]
+            roughness = atlas[..., attr_layout["roughness"]]
+            alpha = atlas[..., attr_layout["alpha"]]
 
             material = trimesh_local.visual.material.PBRMaterial(
                 baseColorTexture=pil_image.fromarray(np_mod.concatenate([base_color, alpha], axis=-1)),
@@ -4864,7 +4809,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 ),
                 metallicFactor=1.0,
                 roughnessFactor=1.0,
-                alphaMode=alpha_mode,
+                alphaMode="OPAQUE",
                 doubleSided=True if not remesh else False,
             )
 
@@ -4894,28 +4839,9 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
 
             return textured_mesh
 
-        postprocess_mod._trellis2_parallel_pbr_inpaint = _parallel_pbr_inpaint
         postprocess_mod.to_glb = _low_vram_to_glb
         postprocess_mod._trellis2_postprocess_patched = True
         return
-
-    if old_inpaint_block not in src:
-        return
-
-    patched_src = src.replace(
-        old_inpaint_block,
-        "    base_color, metallic, roughness, alpha = _trellis2_parallel_pbr_inpaint(base_color, metallic, roughness, alpha, mask_inv)",
-    )
-
-    try:
-        postprocess_mod._trellis2_parallel_pbr_inpaint = _parallel_pbr_inpaint
-        ns: dict[str, Any] = dict(postprocess_mod.__dict__)
-        exec(compile(patched_src, "<trellis2_fast_postprocess>", "exec"), ns)
-        postprocess_mod.to_glb = ns["to_glb"]
-        postprocess_mod._trellis2_postprocess_patched = True
-    except Exception as exc:
-        log.debug("Keeping original o_voxel.postprocess.to_glb: %s", exc)
-
 
 class _FastLosslessPngContext:
     """Use lossless zlib compress_level=1 when serializing 2K/4K PBR PNG textures into GLB (3-4x faster, 100% lossless)."""

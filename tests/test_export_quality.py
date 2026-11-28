@@ -23,6 +23,36 @@ class ExportQualityTests(unittest.TestCase):
             _prepare_export_source(mesh, True, torch)
         mesh.simplify.assert_called_once_with(1000)
 
+    def test_projection_ignores_invalid_bvh_face(self):
+        from runpod.server import _project_bake_positions
+
+        pts = torch.zeros((2, 3))
+        vertices = torch.ones((3, 3))
+        faces = torch.tensor([[0, 1, 2]])
+        bvh = Mock()
+        bvh.unsigned_distance.return_value = (None, torch.tensor([-1, 0]), torch.tensor([[1., 0., 0.]] * 2))
+        projected = _project_bake_positions(pts, bvh, vertices, faces, 1., 2., torch)
+        torch.testing.assert_close(projected[0], pts[0])
+        torch.testing.assert_close(projected[1], vertices[0])
+
+    def test_missing_material_samples_follow_surface(self):
+        import cv2
+        import numpy as np
+        from runpod.server import _extend_material_atlas
+
+        atlas = np.zeros((1, 9, 2), dtype=np.uint8)
+        atlas[0, 0] = (240, 0)
+        atlas[0, 5] = (0, 250)
+        covered = np.array([[1, 1, 1, 1, 0, 1, 0, 0, 1]], dtype=bool)
+        supported = np.array([[1, 0, 0, 0, 0, 1, 0, 0, 0]], dtype=bool)
+        xyz = torch.tensor([[0., 0, 0], [1., 0, 0], [2., 0, 0], [3., 0, 0],
+                            [20., 0, 0], [0.1, 0, 0]])
+        result = _extend_material_atlas(atlas, covered, supported, xyz, cv2, np)
+        for pixel in (0, 1, 2, 3, 8):
+            np.testing.assert_array_equal(result[0, pixel], [240, 0])
+        np.testing.assert_array_equal(result[0, 5], [0, 250])
+        self.assertTrue(all(tuple(row) in {(240, 0), (0, 250)} for row in result[0]))
+
     def test_low_vram_to_glb_cleans_post_simplify_and_recovers_voxel_misses(self) -> None:
         import types
         import cv2
@@ -86,12 +116,15 @@ class ExportQualityTests(unittest.TestCase):
             def read_vertex_normals(self):
                 return torch.tensor([[0.0, 0.0, 1.0]] * 3, dtype=torch.float32)
 
+        projection_counts = []
+
         class FakeBvh:
             def __init__(self, v, f) -> None:
                 pass
 
             def unsigned_distance(self, pts, return_uvw=False):
                 n = int(pts.shape[0])
+                projection_counts.append(n)
                 d = torch.zeros((n,), dtype=torch.float32, device=pts.device)
                 fid = torch.zeros((n,), dtype=torch.int64, device=pts.device)
                 uvw = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32, device=pts.device).repeat(n, 1)
@@ -188,19 +221,20 @@ class ExportQualityTests(unittest.TestCase):
         attrs = torch.ones((2, 6), dtype=torch.float32)
         coords = torch.zeros((2, 3), dtype=torch.int32)
         layout = {"base_color": slice(0, 3), "metallic": slice(3, 4), "roughness": slice(4, 5), "alpha": slice(5, 6)}
-        res_mesh = fake_postprocess.to_glb(
-            vertices=v_in,
-            faces=f_in,
-            attr_volume=attrs,
-            coords=coords,
-            attr_layout=layout,
-            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            grid_size=1536,
-            decimation_target=100,
-            texture_size=8,
-            remesh=True,
-            verbose=False,
-        )
+        with patch.object(torch.cuda, "is_available", return_value=False):
+            res_mesh = fake_postprocess.to_glb(
+                vertices=v_in,
+                faces=f_in,
+                attr_volume=attrs,
+                coords=coords,
+                attr_layout=layout,
+                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                grid_size=1536,
+                decimation_target=100,
+                texture_size=8,
+                remesh=True,
+                verbose=False,
+            )
 
         # Preserve open rims and small components through remeshing and UV unwrap.
         simp_idx = calls.index("simplify")
@@ -215,6 +249,7 @@ class ExportQualityTests(unittest.TestCase):
         )
         self.assertEqual(len(created_meshes), 1)
         self.assertEqual(sample_counts, [9, 2])
+        self.assertEqual(projection_counts, [2])
         tex_arr = np.asarray(res_mesh.visual.material.baseColorTexture)
         roi = tex_arr[1:4, 1:4]
         np.testing.assert_array_equal(roi[0, :2], [[51, 51, 51, 0], [51, 51, 51, 0]])
