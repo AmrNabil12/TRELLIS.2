@@ -11,6 +11,33 @@ from runpod.server import _prepare_export_source, _prefer_quad_diagonal_02
 
 
 class ExportQualityTests(unittest.TestCase):
+    def test_default_worker_runs_upstream_generation_and_export(self):
+        from runpod.server import GenerationParams, Trellis2Engine
+
+        mesh = SimpleNamespace(faces=[(0, 1, 2)], vertices=[], coords=[], attrs=[],
+                               layout={}, voxel_size=1 / 1536, simplify=Mock())
+        engine = Trellis2Engine()
+        engine.low_vram = True
+        engine.status = "ready"
+        engine._pipeline = Mock()
+        engine._pipeline.models = {}
+        engine._pipeline.run.return_value = [mesh]
+        engine._o_voxel = SimpleNamespace(postprocess=SimpleNamespace(to_glb=Mock()))
+        exporter = engine._o_voxel.postprocess.to_glb
+        exporter.return_value.export.side_effect = lambda path, **kw: Path(path).write_bytes(b"glb")
+        stages = []
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mesh.glb"
+            engine.generate_glb(None, GenerationParams(pipeline_type="1536_cascade"),
+                                path, on_stage=stages.append)
+            self.assertEqual(path.read_bytes(), b"glb")
+        engine._pipeline.run.assert_called_once()
+        engine._pipeline.decode_shape_slat.assert_not_called()
+        mesh.simplify.assert_called_once_with(16_777_216)
+        self.assertIs(exporter.call_args.kwargs["faces"], mesh.faces)
+        self.assertEqual(stages, ["diffusion_inference", "simplifying_mesh",
+                                  "baking_textures", "exporting_glb"])
+
     def test_concave_quad_in_either_winding(self):
         quad = torch.tensor([[0., 0., 0.], [2., 0., 0.], [.5, .5, 0.], [0., 2., 0.]])
         points = torch.stack([quad, quad.roll(1, 0), quad.flip(0)])

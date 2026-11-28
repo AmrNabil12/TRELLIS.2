@@ -5599,6 +5599,8 @@ class Trellis2Engine:
         model_id: str | None = None,
         low_vram_setting: str | None = None,
     ) -> None:
+        # Kernel replacements are process-wide, so select the implementation at boot.
+        self.legacy_processing = os.environ.get("TRELLIS2_LEGACY_PROCESSING") == "1"
         self.model_id = model_id or os.environ.get("TRELLIS2_MODEL_ID", DEFAULT_MODEL_ID)
         self._low_vram_setting = low_vram_setting or os.environ.get("TRELLIS2_LOW_VRAM", "auto")
         self.status: str = "loading"
@@ -5650,17 +5652,18 @@ class Trellis2Engine:
             self.vram_gb = round(props.total_memory / (1024**3), 2)
             self.low_vram = _resolve_low_vram(self._low_vram_setting, self.vram_gb)
             stable_sampling = self.vram_gb >= 31.0
-            torch.backends.cuda.matmul.allow_tf32 = not stable_sampling
-            torch.backends.cudnn.allow_tf32 = not stable_sampling
-            torch.backends.cudnn.benchmark = not stable_sampling
-            torch.backends.cudnn.deterministic = stable_sampling
-            for sdp_fn_name in ("enable_flash_sdp", "enable_mem_efficient_sdp"):
-                sdp_fn = getattr(torch.backends.cuda, sdp_fn_name, None)
-                if callable(sdp_fn):
-                    try:
-                        sdp_fn(True)
-                    except Exception:
-                        pass
+            if self.legacy_processing:
+                torch.backends.cuda.matmul.allow_tf32 = not stable_sampling
+                torch.backends.cudnn.allow_tf32 = not stable_sampling
+                torch.backends.cudnn.benchmark = not stable_sampling
+                torch.backends.cudnn.deterministic = stable_sampling
+                for sdp_fn_name in ("enable_flash_sdp", "enable_mem_efficient_sdp"):
+                    sdp_fn = getattr(torch.backends.cuda, sdp_fn_name, None)
+                    if callable(sdp_fn):
+                        try:
+                            sdp_fn(True)
+                        except Exception:
+                            pass
 
             try:
                 build_tag = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:10]
@@ -5673,7 +5676,7 @@ class Trellis2Engine:
                 self.low_vram,
                 build_tag,
             )
-            if stable_sampling:
+            if self.legacy_processing and stable_sampling:
                 log.info("Using sequential guidance and deterministic cuDNN on the 32 GB worker")
 
             self.stage = "downloading_or_loading_weights"
@@ -5705,22 +5708,26 @@ class Trellis2Engine:
             log.info("Post-load HF storage status: %s", _hf_cache_summary())
             # low_vram MUST be set before pipeline.cuda() because Pipeline.to() checks self.low_vram
             pipeline.low_vram = self.low_vram
-            install_trellis2_vram_optimizations(
-                pipeline,
-                torch,
-                low_vram=bool(self.low_vram),
-                vram_gb=self.vram_gb,
-                stable_sampling=stable_sampling,
-            )
+            if self.legacy_processing:
+                install_trellis2_vram_optimizations(
+                    pipeline,
+                    torch,
+                    low_vram=bool(self.low_vram),
+                    vram_gb=self.vram_gb,
+                    stable_sampling=stable_sampling,
+                )
+            else:
+                log.info("Processing with upstream TRELLIS.2 pipeline.run and o_voxel.to_glb")
             self.stage = "moving_to_cuda"
             pipeline.cuda()
             model_mgr: VRAMModelManager | None = None
-            if self.low_vram:
+            if self.legacy_processing and self.low_vram:
                 model_mgr = VRAMModelManager(pipeline, torch, vram_gb=self.vram_gb)
                 model_mgr.warm_initial_models(pipeline.device)
 
-            self.stage = "warming_up_kernels"
-            warmup_pipeline_kernels(pipeline, torch, model_mgr=model_mgr)
+            if self.legacy_processing:
+                self.stage = "warming_up_kernels"
+                warmup_pipeline_kernels(pipeline, torch, model_mgr=model_mgr)
 
             with self._state_lock:
                 self._pipeline = pipeline
@@ -6321,7 +6328,7 @@ class Trellis2Engine:
                     params.texture_size,
                     params.remesh,
                 )
-                if self._can_run_staged():
+                if self.legacy_processing and self._can_run_staged():
                     mesh = self._run_pipeline_staged(
                         image, params, pipeline_type, on_stage=on_stage
                     )
@@ -6366,7 +6373,12 @@ class Trellis2Engine:
                     self._release_vram(offload_models=True)
 
                 _emit("simplifying_mesh")
-                _prepare_export_source(mesh, params.remesh, self._torch)
+                if self.legacy_processing:
+                    _prepare_export_source(mesh, params.remesh, self._torch)
+                else:
+                    # Microsoft example.py applies the nvdiffrast face limit before export.
+                    log.info("Upstream mesh.simplify(16777216), decoded faces=%d", len(mesh.faces))
+                    mesh.simplify(16_777_216)
 
                 _emit("baking_textures")
                 t_bake = time.monotonic()
