@@ -304,7 +304,8 @@ _CUDART_LIB_CACHE: dict[str, Any] = {"loaded": False, "lib": None, "libs": []}
 
 def _is_oom_like(exc: BaseException) -> bool:
     """Return True for PyTorch or C++ extension (e.g. CuMesh) CUDA out-of-memory errors."""
-    return "out of memory" in str(exc).lower() or type(exc).__name__ == "OutOfMemoryError"
+    message = str(exc).lower()
+    return "out of memory" in message or "cudaerrormemoryallocation" in message or type(exc).__name__ == "OutOfMemoryError"
 
 
 def _clear_sticky_cuda_error(torch_mod: Any, cudart_lib: Any = None) -> int:
@@ -3893,6 +3894,20 @@ def _simplify_mesh_oom_safe(
     mesh_obj.faces = all_f.to(orig_dev) if all_f.device != orig_dev else all_f
 
 
+def _prepare_export_source(mesh: Any, remesh: bool, torch_mod: Any) -> None:
+    # A BVH can reference the full decoder mesh. The final triangle budget
+    # applies after reconstruction, independently of this optional operator cap.
+    raw_faces = mesh.faces.shape[0] if hasattr(mesh.faces, "shape") else len(mesh.faces)
+    limit = int(os.environ.get("TRELLIS2_PRE_REMESH_MAX_FACES", "0")) if remesh else 0
+    if limit < 0:
+        raise ValueError("TRELLIS2_PRE_REMESH_MAX_FACES must be zero or positive")
+    if 0 < limit < raw_faces:
+        mesh.simplify(limit)
+        _clean_pre_remesh_mesh(mesh, torch_mod)
+    log.info("Export reference: %d decoded faces, %d source faces (explicit cap=%d)",
+             raw_faces, mesh.faces.shape[0] if hasattr(mesh.faces, "shape") else len(mesh.faces), limit)
+
+
 def _clean_pre_remesh_mesh(mesh_obj: Any, torch_mod: Any) -> None:
     """Drop degenerate/duplicate faces left by high-ratio simplification before fill_holes or remeshing."""
     verts = getattr(mesh_obj, "vertices", None)
@@ -4103,6 +4118,23 @@ def gpu_dilate_uv_gutters(
     )
 
 
+def _prefer_quad_diagonal_02(points: Any, torch_mod: Any) -> Any:
+    """Choose the consistently wound split, breaking planar ties by diagonal length."""
+    a, b, c, d = points.unbind(dim=1)
+    ac, bd = c - a, d - b
+
+    def alignment(first: Any, second: Any) -> Any:
+        areas = first.norm(dim=1) * second.norm(dim=1)
+        dot = (first * second).sum(dim=1)
+        # A zero-area triangle loses to every nondegenerate candidate.
+        return torch_mod.where(areas > 0, dot / areas.clamp_min(1e-30), -2.0)
+
+    score_ac = alignment(torch_mod.linalg.cross(b - a, ac), torch_mod.linalg.cross(ac, d - a))
+    score_bd = alignment(torch_mod.linalg.cross(b - a, d - a), torch_mod.linalg.cross(c - b, bd))
+    tied = (score_ac - score_bd).abs() < 1e-6
+    return torch_mod.where(tied, ac.square().sum(1) <= bd.square().sum(1), score_ac > score_bd)
+
+
 def _chunked_remesh_narrow_band_dc(
     vertices: Any,
     faces: Any,
@@ -4121,14 +4153,7 @@ def _chunked_remesh_narrow_band_dc(
     quad_chunk: int = 2_000_000,
     proj_chunk: int = 4_000_000,
 ) -> tuple[Any, Any]:
-    """Bit-exact memory-optimal replacement for cumesh.remeshing.remesh_narrow_band_dc.
-
-    Upstream keeps >10 GiB of dead intermediates (edge_neighbor_voxel, connected_voxel_hash_key,
-    connected_voxel, hashmap_vert, hashmap_vox, pts_vert, grid_verts) alive simultaneously with
-    unchunked 21M-quad torch.cross splits (~22 GiB peak at 1408-1536). Releasing intermediates at
-    last use and chunking UDF/hashmap/quad-split/projection cuts peak VRAM to ~2.6 GiB with
-    100% identical output vertices and faces.
-    """
+    """Extract and triangulate a narrow-band surface in bounded GPU batches."""
     assert vertices.ndim == 2 and vertices.shape[1] == 3 and vertices.dtype == torch_mod.float32
     assert faces.ndim == 2 and faces.shape[1] == 3 and faces.dtype == torch_mod.int32
     assert center.ndim == 1 and center.shape[0] == 3
@@ -4352,37 +4377,12 @@ def _chunked_remesh_narrow_band_dc(
         e = min(num_quads, s + step_quad)
         q_c = quad_indices[s:e]
         d_pos = (intersected_dir[s:e] == 1).unsqueeze(1)
-        t0 = torch_mod.where(d_pos, q_c[:, quad_split_1_p], q_c[:, quad_split_1_n])
-        n0 = torch_mod.linalg.cross(
-            mesh_vertices[t0[:, 1]] - mesh_vertices[t0[:, 0]],
-            mesh_vertices[t0[:, 2]] - mesh_vertices[t0[:, 0]],
-            dim=-1,
-        )
-        n1 = torch_mod.linalg.cross(
-            mesh_vertices[t0[:, 2]] - mesh_vertices[t0[:, 1]],
-            mesh_vertices[t0[:, 3]] - mesh_vertices[t0[:, 1]],
-            dim=-1,
-        )
-        align0 = (n0 * n1).sum(dim=1).abs()
-        del n0, n1
-
-        t1 = torch_mod.where(d_pos, q_c[:, quad_split_2_p], q_c[:, quad_split_2_n])
-        n0 = torch_mod.linalg.cross(
-            mesh_vertices[t1[:, 1]] - mesh_vertices[t1[:, 0]],
-            mesh_vertices[t1[:, 2]] - mesh_vertices[t1[:, 0]],
-            dim=-1,
-        )
-        n1 = torch_mod.linalg.cross(
-            mesh_vertices[t1[:, 2]] - mesh_vertices[t1[:, 1]],
-            mesh_vertices[t1[:, 3]] - mesh_vertices[t1[:, 1]],
-            dim=-1,
-        )
-        align1 = (n0 * n1).sum(dim=1).abs()
-        del n0, n1, d_pos, q_c
-
-        chosen = torch_mod.where((align0 > align1).unsqueeze(1), t0, t1).reshape(-1, 3).int()
-        mesh_triangles[2 * s : 2 * e] = chosen
-        del t0, t1, align0, align1, chosen
+        prefer_ac = _prefer_quad_diagonal_02(mesh_vertices[q_c], torch_mod).unsqueeze(1)
+        split_ac = torch_mod.where(d_pos, quad_split_1_p, quad_split_1_n)
+        split_bd = torch_mod.where(d_pos, quad_split_2_p, quad_split_2_n)
+        split = torch_mod.where(prefer_ac, split_ac, split_bd)
+        mesh_triangles[2 * s : 2 * e] = q_c.gather(1, split).reshape(-1, 3)
+        del d_pos, q_c, prefer_ac, split_ac, split_bd, split
 
     del quad_indices, intersected_dir
 
@@ -4586,9 +4586,13 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
 
             _flush_allocator_for_cpp()
+            # Reuse the staged CPU tensors if the BVH must be rebuilt after decimation.
+            orig_verts_cpu = vertices if remesh and vertices.device.type == "cpu" else None
+            orig_faces_cpu = faces if remesh and faces.device.type == "cpu" else None
             vertices = _to_dev(vertices)
             faces = _to_dev(faces)
-            vertices, faces = _compact_mesh_vertices(vertices, faces, t_mod)
+            if not remesh:
+                vertices, faces = _compact_mesh_vertices(vertices, faces, t_mod)
             _flush_allocator_for_cpp()
 
             mesh = None
@@ -4617,8 +4621,6 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             if verbose:
                 print("Cleaning mesh...")
 
-            orig_verts_cpu = None
-            orig_faces_cpu = None
 
             if not remesh:
                 assert mesh is not None
@@ -4668,11 +4670,6 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                         bvh=bvh,
                     )
                     dc_f_cnt = int(dc_faces.shape[0])
-                    if stage_vol_cpu and vertices is not None:
-                        orig_verts_cpu = vertices.cpu()
-                        orig_faces_cpu = faces.cpu()
-                        vertices = None
-                        faces = None
                     mesh = cumesh_local.CuMesh()
                     mesh.init(dc_verts, dc_faces)
                     del dc_verts, dc_faces
@@ -4681,15 +4678,12 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                     # Release cuBVH before high-face single-shot CuMesh.simplify when VRAM is tight;
                     # Stage 5 rebuilds cuBVH cleanly from orig_verts_cpu after uv_unwrap frees mesh.
                     if bvh is not None and dc_f_cnt > 25_000_000 and use_cuda:
-                        if vertices is not None:
-                            orig_verts_cpu = vertices.cpu()
-                            orig_faces_cpu = faces.cpu()
-                            vertices = None
-                            faces = None
                         free_pre_simp = _cuda_free_gb(t_mod)
                         if free_pre_simp is None or (free_pre_simp * (1024**3)) < (dc_f_cnt * 220 * 1.15):
-                            del bvh
-                            bvh = None
+                            if orig_verts_cpu is None:
+                                orig_verts_cpu = vertices.cpu()
+                                orig_faces_cpu = faces.cpu()
+                            bvh = vertices = faces = None
                     # Release all PyTorch cached segments BEFORE CuMesh C++ simplify calls raw cudaMalloc()
                     _flush_allocator_for_cpp()
                     if verbose:
@@ -4706,18 +4700,8 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                         mesh.remove_duplicate_faces()
                     if hasattr(mesh, "fill_holes"):
                         faces_before_fill = mesh.num_faces
-                        # This pass is for pinholes left by decimation. Scale
-                        # its perimeter limit with the actual remesh grid.
-                        try:
-                            mesh.fill_holes(max_hole_perimeter=12 * scale / dc_res)
-                        except Exception as fh_exc:
-                            if not _is_oom_like(fh_exc):
-                                raise
-                            _clear_sticky_cuda_error(t_mod)
-                            _flush_allocator_for_cpp()
-                            log.warning("Skipping post-decimation pinhole fill after VRAM OOM (%s)", fh_exc)
-                        else:
-                            log.info("Post-decimation pinhole fill added %d faces", mesh.num_faces - faces_before_fill)
+                        mesh.fill_holes(max_hole_perimeter=12 * scale / dc_res)
+                        log.info("Post-decimation pinhole fill added %d faces", mesh.num_faces - faces_before_fill)
                 except Exception as remesh_exc:
                     if remesh_exc.__traceback__ is not None:
                         traceback.clear_frames(remesh_exc.__traceback__)
@@ -4773,19 +4757,9 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 [out_uvs * 2 - 1, t_mod.zeros_like(out_uvs[:, :1]), t_mod.ones_like(out_uvs[:, :1])],
                 dim=-1,
             ).unsqueeze(0)
-            rast = t_mod.zeros((1, texture_size, texture_size, 4), device=target_dev, dtype=t_mod.float32)
-
-            for i in range(0, int(out_faces.shape[0]), 100000):
-                rast_chunk, _ = dr_local.rasterize(
-                    ctx,
-                    uvs_rast,
-                    out_faces[i : i + 100000],
-                    resolution=[texture_size, texture_size],
-                )
-                mask_chunk = rast_chunk[..., 3:4] > 0
-                rast_chunk[..., 3:4] += i
-                t_mod.where(mask_chunk, rast_chunk, rast, out=rast)
-                del rast_chunk, mask_chunk
+            # The API caps output at two million faces, within exact float32 raster IDs.
+            rast, derivatives = dr_local.rasterize(ctx, uvs_rast, out_faces, resolution=[texture_size, texture_size])
+            del derivatives
 
             mask = rast[0, ..., 3] > 0
             pos = dr_local.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
@@ -4839,16 +4813,19 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                         -1, attr_channels + 1
                     )
 
-                sampled = _sample(projected_pos)
+                # A supported material on the displayed surface wins. Closest-point
+                # projection can land on another sheet at thin material boundaries.
+                sampled = _sample(valid_pos)
                 missing = sampled[:, attr_channels] <= 0
-                # Retry using the actual exported surface only where projection
-                # changed the position. Axis sweeps can sample another layer.
                 retry = missing & (projected_pos != valid_pos).any(dim=1)
                 if bool(retry.any()):
-                    sampled[retry] = _sample(valid_pos[retry])
-                bake_mask[mask] = sampled[:, attr_channels] > 0
+                    sampled[retry] = _sample(projected_pos[retry])
+                supported = sampled[:, attr_channels] > 0
+                bake_mask[mask] = supported
                 attrs[mask] = sampled[:, :attr_channels]
-                del sampled, missing, retry, features, coords_batch
+                log.info("Material bake: %d surface hits, %d projection recoveries, %d unsupported",
+                         n_valid - int(missing.sum()), int((missing & supported).sum()), int((~supported).sum()))
+                del sampled, missing, retry, supported, features, coords_batch
             del attr_vol_staged, coords_staged, valid_pos, projected_pos
             _flush_allocator_for_cpp()
 
@@ -6017,37 +5994,17 @@ class Trellis2Engine:
                         shape_dec.cpu()
                     self._release_vram(offload_models=False)
 
-                hr_resolution = target_res
-                while True:
-                    quant_coords = torch.cat(
-                        [
-                            hr_coords[:, :1],
-                            ((hr_coords[:, 1:] + 0.5) / 512 * (hr_resolution // 16)).int(),
-                        ],
-                        dim=1,
-                    )
-                    hr_unique = quant_coords.unique(dim=0)
-                    del quant_coords
-                    if hr_unique.shape[0] < max_num_tokens or hr_resolution == 1024:
-                        if hr_resolution != target_res:
-                            log.info(
-                                "Reduced cascade resolution %d -> %d to fit max_num_tokens=%d (tokens=%d)",
-                                target_res,
-                                hr_resolution,
-                                max_num_tokens,
-                                hr_unique.shape[0],
-                            )
-                        else:
-                            log.info(
-                                "Cascade target resolution %d achieved (tokens=%d <= max_num_tokens=%d)",
-                                hr_resolution,
-                                hr_unique.shape[0],
-                                max_num_tokens,
-                            )
-                        break
-                    hr_resolution -= 128
-                del hr_coords
-                res = hr_resolution
+                res = target_res
+                quant_coords = torch.cat([
+                    hr_coords[:, :1],
+                    ((hr_coords[:, 1:] + 0.5) / 512 * (res // 16)).int(),
+                ], dim=1)
+                hr_unique = quant_coords.unique(dim=0)
+                del quant_coords, hr_coords
+                if hr_unique.shape[0] > max_num_tokens:
+                    raise ValueError(f"{res} requires {hr_unique.shape[0]} tokens, exceeding "
+                                     f"TRELLIS2_MAX_NUM_TOKENS={max_num_tokens}")
+                log.info("Cascade resolution %d, tokens %d", res, hr_unique.shape[0])
                 _log_stage(f"upsample_coords({res})", t_st)
 
                 assert cond_1024_saved is not None
@@ -6172,39 +6129,10 @@ class Trellis2Engine:
 
             m = meshes[0]
             del meshes
-            max_rast_faces = (
-                int(os.environ.get("TRELLIS2_PRE_REMESH_MAX_FACES", "33554432"))
-                if params.remesh
-                else 16_777_216
-            )
-            if (
-                getattr(getattr(m, "vertices", None), "is_cuda", False)
-                and getattr(getattr(m, "faces", None), "is_cuda", False)
-            ):
-                orig_v_cnt = int(m.vertices.shape[0])
-                m.vertices, m.faces = _compact_mesh_vertices(m.vertices, m.faces, torch)
-                if int(m.vertices.shape[0]) < orig_v_cnt:
-                    log.info(
-                        "Compacted mesh vertices before CuMesh cleanup: %d -> %d (faces=%d)",
-                        orig_v_cnt,
-                        int(m.vertices.shape[0]),
-                        int(m.faces.shape[0]),
-                    )
-
-            is_oversized_mesh = int(getattr(getattr(m, "faces", None), "shape", (0,))[0]) > max_rast_faces
             tex_dec = pipe.models.get("tex_slat_decoder")
-            defer_tex_load = bool(tight_gpu or res > 1024 or is_oversized_mesh)
+            defer_tex_load = tight_gpu or res > 1024
             if mgr is not None and defer_tex_load:
                 mgr.evict_except([], clear_cache=True)
-            if is_oversized_mesh:
-                log.info(
-                    "Simplifying oversized raw mesh from %d toward %d faces",
-                    int(m.faces.shape[0]),
-                    max_rast_faces,
-                )
-                m.simplify(max_rast_faces)
-                _clean_pre_remesh_mesh(m, torch)
-                log.info("Prepared export source with %d faces", int(m.faces.shape[0]))
 
             free_after_shape = _cuda_free_gb(torch)
             spill_mesh_geom = bool(
@@ -6324,6 +6252,12 @@ class Trellis2Engine:
                     except (TypeError, ValueError):
                         pass
                     mesh = self._pipeline.run(image, **run_kwargs)[0]
+                    if (pipeline_type == "1536_cascade" and "max_num_tokens" in run_kwargs
+                            and isinstance(mesh.voxel_size, (float, int))):
+                        resolution = round(1 / mesh.voxel_size)
+                        if resolution != 1536:
+                            raise ValueError(f"Requested 1536 cascade produced resolution {resolution}; "
+                                             "increase TRELLIS2_MAX_NUM_TOKENS for this input")
 
                 # Free neural models before CuMesh/cuBVH/nvdiffrast high-res baking (no models needed after decode)
                 if self._model_mgr is not None:
@@ -6340,12 +6274,7 @@ class Trellis2Engine:
                     self._release_vram(offload_models=True)
 
                 _emit("simplifying_mesh")
-                pre_bake_max_faces = (
-                    int(os.environ.get("TRELLIS2_PRE_REMESH_MAX_FACES", "33554432"))
-                    if params.remesh
-                    else 16_777_216
-                )
-                mesh.simplify(pre_bake_max_faces)
+                _prepare_export_source(mesh, params.remesh, self._torch)
 
                 _emit("baking_textures")
                 t_bake = time.monotonic()
@@ -6686,10 +6615,13 @@ class JobManager:
             log.exception("Job %s failed", job_id)
             fail_ts = time.time()
             with self._lock:
+                failed_stage = record.stage
                 record.status = "failed"
                 record.stage = "failed"
                 record.stage_started_at = fail_ts
-                record.error = f"{type(exc).__name__}: {exc}"
+                record.error = f"{failed_stage}: {type(exc).__name__}: {exc}"
+                if _is_oom_like(exc):
+                    record.error += " (memory exhausted at the requested settings; check GPU and host memory)"
                 record.finished_at = fail_ts
                 self._write_status(record)
 
