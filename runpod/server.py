@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+if os.name != "nt":
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
     "expandable_segments:True,garbage_collection_threshold:0.8"
@@ -234,6 +236,34 @@ class GenerationParams(BaseModel):
     remesh_project: float = Field(default=0.0, ge=0.0, le=1.0)
     preprocess_image: bool = True
     extension_webp: bool = False
+
+
+def _sampler_overrides() -> tuple[dict[str, Any], dict[str, Any]]:
+    shape: dict[str, Any] = {}
+    texture: dict[str, Any] = {}
+    for target, variable in (
+        (shape, "TRELLIS2_SHAPE_STEPS"), (texture, "TRELLIS2_TEXTURE_STEPS")
+    ):
+        value = os.environ.get(variable)
+        if value is not None:
+            steps = int(value)
+            if not 1 <= steps <= 50:
+                raise ValueError(f"{variable} must be between 1 and 50")
+            target["steps"] = steps
+    value = os.environ.get("TRELLIS2_TEXTURE_GUIDANCE")
+    if value is not None:
+        strength = float(value)
+        if not 1 <= strength <= 10:
+            raise ValueError("TRELLIS2_TEXTURE_GUIDANCE must be between 1 and 10")
+        texture["guidance_strength"] = strength
+    return shape, texture
+
+
+def _stage_fingerprint(tensor: Any, torch_mod: Any) -> str:
+    data = tensor.detach().cpu().contiguous().reshape(-1).view(torch_mod.uint8).numpy()
+    digest = hashlib.sha256(f"{tensor.dtype}:{tuple(tensor.shape)}:".encode())
+    digest.update(memoryview(data))
+    return digest.hexdigest()[:16]
 
 
 def parse_generation_params(
@@ -1782,7 +1812,7 @@ def patch_sparse_unet_decoder(
         stream = bool(getattr(self, "low_vram", False) or getattr(self, "_stream_active_blocks", False))
         share_cross_cache = not stream
 
-        cross_caches: dict[int, dict[str, Any]] | None = None
+        cross_caches: dict[int, tuple[Any, dict[str, Any]]] | None = None
         if guide_subs and len(guide_subs) > 0:
             cross_caches = getattr(guide_subs[0], "_cross_decoder_stage_caches", None)
             if cross_caches is not None:
@@ -1796,15 +1826,15 @@ def patch_sparse_unet_decoder(
         h = h.type(self.dtype)
 
         subs = []
-        saved_stage_caches: dict[int, dict[str, Any]] = {}
+        saved_stage_caches: dict[int, tuple[Any, dict[str, Any]]] = {}
         cross_cache_max_voxels = 1_000_000
         num_stages = len(self.blocks)
         try:
             for i, res in enumerate(self.blocks):
                 num_res = len(res)
                 if cross_caches is not None and i in cross_caches and not stream and hasattr(h, "_spatial_cache"):
-                    expected_n, stage_dict = cross_caches.pop(i)
-                    if h.coords.shape[0] == expected_n:
+                    cached_coords, stage_dict = cross_caches.pop(i)
+                    if h.coords.device == cached_coords.device and torch_mod.equal(h.coords, cached_coords):
                         scale_k = str(getattr(h, "_scale", ""))
                         h._spatial_cache[scale_k] = stage_dict
 
@@ -1850,7 +1880,7 @@ def patch_sparse_unet_decoder(
                                     if cur_sc:
                                         filtered = {k: v for k, v in cur_sc.items() if k != "subdivision"}
                                         if filtered:
-                                            saved_stage_caches[i] = (h.coords.shape[0], filtered)
+                                            saved_stage_caches[i] = (h.coords, filtered)
                             if self.pred_subdiv:
                                 h, sub = block(h)
                                 if stream and hasattr(sub, "cpu"):
@@ -1883,7 +1913,7 @@ def patch_sparse_unet_decoder(
                         if cur_sc:
                             filtered = {k: v for k, v in cur_sc.items() if k != "subdivision"}
                             if filtered:
-                                saved_stage_caches[i] = (h.coords.shape[0], filtered)
+                                saved_stage_caches[i] = (h.coords, filtered)
 
                 if hasattr(h, "clear_spatial_cache"):
                     h.clear_spatial_cache()
@@ -2523,6 +2553,8 @@ def patch_cfg_sampler_batching(
     sparse_tensor_cls: Any,
     varlen_cat_fn: Callable[..., Any] | None,
     torch_mod: Any,
+    *,
+    batch_cfg: bool = True,
 ) -> None:
     """Batch positive+negative Classifier-Free Guidance into one batch=2 pass & manage KV/RoPE caches."""
     if not _is_already_patched(cfg_mixin_cls, "_trellis2_batch_cfg_patched"):
@@ -2768,7 +2800,7 @@ def patch_cfg_sampler_batching(
             is_cuda_run = noise_dev is not None and str(noise_dev).startswith("cuda")
             free_gb = _cuda_free_gb(torch_mod) if is_cuda_run else None
             use_kv_cache = free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 0.3
-            use_batch_cfg = free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 0.8
+            use_batch_cfg = batch_cfg and (free_gb is None or free_gb >= VRAM_SAFETY_FLOOR_GB + 0.8)
 
             model_dtype = getattr(model, "dtype", None)
             autocast_on = bool(
@@ -5427,8 +5459,9 @@ def install_trellis2_vram_optimizations(
     torch_mod: Any,
     low_vram: bool = True,
     vram_gb: float | None = None,
+    stable_sampling: bool = False,
 ) -> None:
-    """Install zero-quality-loss VRAM optimizations and VRAM-backed compute/caching accelerations."""
+    """Install memory-saving kernels and optional inference accelerations."""
     import cv2
     import numpy as np
     import o_voxel.postprocess as o_voxel_postprocess_mod
@@ -5516,8 +5549,10 @@ def install_trellis2_vram_optimizations(
         SparseTensor,
         varlen_cat,
         torch_mod,
+        batch_cfg=not stable_sampling,
     )
-    patch_sparse_structure_cudagraph(SparseStructureFlowModel, torch_mod)
+    if not stable_sampling:
+        patch_sparse_structure_cudagraph(SparseStructureFlowModel, torch_mod)
     try:
         import cumesh as _cumesh_top  # type: ignore[import-not-found]
     except Exception:
@@ -5610,9 +5645,15 @@ class Trellis2Engine:
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA GPU is not available inside the container.")
 
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
+            props = torch.cuda.get_device_properties(0)
+            self.gpu_name = props.name
+            self.vram_gb = round(props.total_memory / (1024**3), 2)
+            self.low_vram = _resolve_low_vram(self._low_vram_setting, self.vram_gb)
+            stable_sampling = self.vram_gb >= 31.0
+            torch.backends.cuda.matmul.allow_tf32 = not stable_sampling
+            torch.backends.cudnn.allow_tf32 = not stable_sampling
+            torch.backends.cudnn.benchmark = not stable_sampling
+            torch.backends.cudnn.deterministic = stable_sampling
             for sdp_fn_name in ("enable_flash_sdp", "enable_mem_efficient_sdp"):
                 sdp_fn = getattr(torch.backends.cuda, sdp_fn_name, None)
                 if callable(sdp_fn):
@@ -5620,11 +5661,6 @@ class Trellis2Engine:
                         sdp_fn(True)
                     except Exception:
                         pass
-
-            props = torch.cuda.get_device_properties(0)
-            self.gpu_name = props.name
-            self.vram_gb = round(props.total_memory / (1024**3), 2)
-            self.low_vram = _resolve_low_vram(self._low_vram_setting, self.vram_gb)
 
             try:
                 build_tag = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:10]
@@ -5637,6 +5673,8 @@ class Trellis2Engine:
                 self.low_vram,
                 build_tag,
             )
+            if stable_sampling:
+                log.info("Using sequential guidance and deterministic cuDNN on the 32 GB worker")
 
             self.stage = "downloading_or_loading_weights"
             token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -5672,6 +5710,7 @@ class Trellis2Engine:
                 torch,
                 low_vram=bool(self.low_vram),
                 vram_gb=self.vram_gb,
+                stable_sampling=stable_sampling,
             )
             self.stage = "moving_to_cuda"
             pipeline.cuda()
@@ -5809,6 +5848,16 @@ class Trellis2Engine:
 
         torch = self._torch
         pipe = self._pipeline
+        shape_overrides, texture_overrides = _sampler_overrides()
+        if shape_overrides or texture_overrides:
+            log.info("Sampler overrides: shape=%s texture=%s", shape_overrides, texture_overrides)
+        fingerprint_enabled = os.environ.get("TRELLIS2_STAGE_FINGERPRINTS") == "1"
+
+        def fingerprint(label: str, value: Any) -> None:
+            if fingerprint_enabled:
+                tensor = getattr(value, "feats", value)
+                log.info("Inference fingerprint %s=%s", label, _stage_fingerprint(tensor, torch))
+
         mgr = self._model_mgr
         floor = VRAM_SAFETY_FLOOR_GB
         saved_pipe_low_vram = getattr(pipe, "low_vram", True)
@@ -5849,6 +5898,11 @@ class Trellis2Engine:
                     self._release_vram(offload_models=True)
                 _log_stage("preprocess_image", t_st)
 
+            if fingerprint_enabled:
+                image_digest = hashlib.sha256(
+                    f"{image.mode}:{image.size}:".encode() + image.tobytes()
+                ).hexdigest()[:16]
+                log.info("Inference fingerprint preprocessed_image=%s", image_digest)
             torch.manual_seed(params.seed)
             _emit("extracting_features")
             t_st = time.monotonic()
@@ -5866,6 +5920,10 @@ class Trellis2Engine:
                 )
             cond_512 = pipe.get_cond([image], 512)
             cond_1024_raw = pipe.get_cond([image], 1024) if pipeline_type != "512" else None
+            if fingerprint_enabled:
+                fingerprint("cond512", cond_512["cond"])
+                if cond_1024_raw is not None:
+                    fingerprint("cond1024", cond_1024_raw["cond"])
             free_after_cond = _cuda_free_gb(torch)
             keep_cond_gpu = bool(
                 mgr is not None and free_after_cond is not None and free_after_cond >= (floor + 1.0)
@@ -5892,6 +5950,7 @@ class Trellis2Engine:
                 )
                 mgr.prefetch_async([next_flow], pipe.device, min_free_after_gb=floor + 1.5)
             coords = pipe.sample_sparse_structure(cond_512, ss_res, 1, {})
+            fingerprint("sparse_structure", coords)
             if mgr is None:
                 self._release_vram(offload_models=True)
             _log_stage("sample_sparse_structure", t_st)
@@ -5905,7 +5964,7 @@ class Trellis2Engine:
                         ["tex_slat_flow_model_512"], pipe.device, min_free_after_gb=floor + 1.5
                     )
                 shape_slat = pipe.sample_shape_slat(
-                    cond_512, pipe.models["shape_slat_flow_model_512"], coords, {}
+                    cond_512, pipe.models["shape_slat_flow_model_512"], coords, shape_overrides
                 )
                 del coords
                 if mgr is None:
@@ -5919,7 +5978,7 @@ class Trellis2Engine:
                         ["shape_slat_decoder"], pipe.device, min_free_after_gb=floor + 1.5
                     )
                 tex_slat = pipe.sample_tex_slat(
-                    cond_512, pipe.models["tex_slat_flow_model_512"], shape_slat, {}
+                    cond_512, pipe.models["tex_slat_flow_model_512"], shape_slat, texture_overrides
                 )
                 del cond_512
                 if mgr is None:
@@ -5942,7 +6001,7 @@ class Trellis2Engine:
                         ["tex_slat_flow_model_1024"], pipe.device, min_free_after_gb=floor + 2.5
                     )
                 shape_slat = pipe.sample_shape_slat(
-                    cond_1024, pipe.models["shape_slat_flow_model_1024"], coords, {}
+                    cond_1024, pipe.models["shape_slat_flow_model_1024"], coords, shape_overrides
                 )
                 del coords
                 if mgr is None:
@@ -5956,7 +6015,7 @@ class Trellis2Engine:
                         ["shape_slat_decoder"], pipe.device, min_free_after_gb=floor + 2.5
                     )
                 tex_slat = pipe.sample_tex_slat(
-                    cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, {}
+                    cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, texture_overrides
                 )
                 del cond_1024
                 if mgr is None:
@@ -5983,8 +6042,9 @@ class Trellis2Engine:
                         min_free_after_gb=floor + 1.5,
                     )
                 slat_lr = pipe.sample_shape_slat(
-                    cond_512, pipe.models["shape_slat_flow_model_512"], coords, {}
+                    cond_512, pipe.models["shape_slat_flow_model_512"], coords, shape_overrides
                 )
+                fingerprint("coarse_shape_latent", slat_lr)
                 del cond_512, coords
                 if mgr is None:
                     self._release_vram(offload_models=True)
@@ -6027,6 +6087,7 @@ class Trellis2Engine:
                 if hr_unique.shape[0] > max_num_tokens:
                     raise ValueError(f"{res} requires {hr_unique.shape[0]} tokens, exceeding "
                                      f"TRELLIS2_MAX_NUM_TOKENS={max_num_tokens}")
+                fingerprint("cascade_coords", hr_unique)
                 log.info("Cascade resolution %d, tokens %d", res, hr_unique.shape[0])
                 _log_stage(f"upsample_coords({res})", t_st)
 
@@ -6060,7 +6121,7 @@ class Trellis2Engine:
                             min_free_after_gb=hr_flow_headroom_gb + 0.5,
                         )
                 shape_slat = pipe.sample_shape_slat(
-                    cond_1024, pipe.models["shape_slat_flow_model_1024"], hr_unique, {}
+                    cond_1024, pipe.models["shape_slat_flow_model_1024"], hr_unique, shape_overrides
                 )
                 del hr_unique
                 if mgr is None:
@@ -6084,7 +6145,7 @@ class Trellis2Engine:
                         min_free_after_gb=hr_flow_headroom_gb + 0.5,
                     )
                 tex_slat = pipe.sample_tex_slat(
-                    cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, {}
+                    cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, texture_overrides
                 )
                 del cond_1024
                 if mgr is None:
@@ -6092,6 +6153,9 @@ class Trellis2Engine:
                 _log_stage(f"sample_tex_slat({res})", t_st)
             else:
                 raise ValueError(f"Invalid pipeline type: {pipeline_type}")
+
+            fingerprint("shape_latent", shape_slat)
+            fingerprint("texture_latent", tex_slat)
 
             # On <=32 GiB GPUs (e.g., 24 GiB RTX 4090), all DiT flow models are finished for this job;
             # evicting them before 3D sparse VAE decoding frees ~10-14 GiB of VRAM for FlexGEMM/C2S at 1024^3-1536^3.
@@ -6274,6 +6338,11 @@ class Trellis2Engine:
                             )
                     except (TypeError, ValueError):
                         pass
+                    shape_overrides, texture_overrides = _sampler_overrides()
+                    if shape_overrides:
+                        run_kwargs["shape_slat_sampler_params"] = shape_overrides
+                    if texture_overrides:
+                        run_kwargs["tex_slat_sampler_params"] = texture_overrides
                     mesh = self._pipeline.run(image, **run_kwargs)[0]
                     if (pipeline_type == "1536_cascade" and "max_num_tokens" in run_kwargs
                             and isinstance(mesh.voxel_size, (float, int))):
