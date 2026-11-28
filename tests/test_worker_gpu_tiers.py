@@ -14,11 +14,16 @@ class WorkerGpuTierTests(unittest.TestCase):
         engine.vram_gb = 23.52
         for pipeline_type in ("512", "1024", "1024_cascade"):
             engine.validate_pipeline_gpu(pipeline_type)
-        with self.assertRaisesRegex(ValueError, "requires a 32 GB GPU"):
+        with self.assertRaisesRegex(ValueError, "requires a 96 GB GPU"):
             engine.validate_pipeline_gpu("1536_cascade")
 
-        engine.vram_gb = 31.85
-        engine.validate_pipeline_gpu("1536_cascade")
+        for capacity in (31.36, 47.5, 79.5):
+            engine.vram_gb = capacity
+            with self.assertRaisesRegex(ValueError, "requires a 96 GB GPU"):
+                engine.validate_pipeline_gpu("1536_cascade")
+        for capacity in (89.5, 95.5, 96.0):
+            engine.vram_gb = capacity
+            engine.validate_pipeline_gpu("1536_cascade")
         with self.assertRaisesRegex(ValueError, "requires a 24 GB GPU"):
             engine.validate_pipeline_gpu("1024_cascade")
 
@@ -38,7 +43,7 @@ class WorkerGpuTierTests(unittest.TestCase):
                         files={"image": ("unused.png", b"unused", "image/png")},
                     )
                     self.assertEqual(response.status_code, 422, response.text)
-                    self.assertIn("requires a 32 GB GPU", response.json()["detail"])
-            with self.assertRaisesRegex(ValueError, "requires a 32 GB GPU"):
+                    self.assertIn("requires a 96 GB GPU", response.json()["detail"])
+            with self.assertRaisesRegex(ValueError, "requires a 96 GB GPU"):
                 engine.generate_glb(None, GenerationParams(pipeline_type="1536_cascade"), jobs / "mesh.glb")
         engine._run_once.assert_not_called()

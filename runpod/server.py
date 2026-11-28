@@ -212,6 +212,8 @@ PipelineType = Literal["512", "1024", "1024_cascade", "1536_cascade"]
 DEFAULT_MODEL_ID = "microsoft/TRELLIS.2-4B"
 MAX_RETAINED_JOBS = int(os.environ.get("MAX_RETAINED_JOBS", "20"))
 HIGH_VRAM_THRESHOLD_GB = 44.0
+# CUDA reports usable memory. Allow headroom for ECC and driver reservations.
+MIN_96GB_USABLE_GIB = 89.0
 VRAM_SAFETY_FLOOR_GB = max(2.0, float(os.environ.get("TRELLIS2_VRAM_RESERVE_GB", "4.0")))
 MAX_INPUT_DIMENSION = max(256, int(os.environ.get("TRELLIS2_MAX_INPUT_DIM", "1536")))
 DEFAULT_VOXEL_CHUNK_SIZE = max(16_384, int(os.environ.get("TRELLIS2_VOXEL_CHUNK", "262144")))
@@ -5651,6 +5653,9 @@ class Trellis2Engine:
             self.gpu_name = props.name
             self.vram_gb = round(props.total_memory / (1024**3), 2)
             self.low_vram = _resolve_low_vram(self._low_vram_setting, self.vram_gb)
+            if self.vram_gb >= MIN_96GB_USABLE_GIB:
+                self.low_vram = False
+                self.legacy_processing = False
             stable_sampling = self.vram_gb >= 31.0
             if self.legacy_processing:
                 torch.backends.cuda.matmul.allow_tf32 = not stable_sampling
@@ -5716,7 +5721,7 @@ class Trellis2Engine:
                     vram_gb=self.vram_gb,
                     stable_sampling=stable_sampling,
                 )
-            else:
+            elif self.low_vram:
                 from trellis2.models.sc_vaes.sparse_unet_vae import SparseConvNeXtBlock3d
                 from trellis2.modules.norm import LayerNorm32
 
@@ -5729,7 +5734,8 @@ class Trellis2Engine:
                         activation = block.mlp[1]
                         if isinstance(activation, torch.nn.SiLU):
                             activation.inplace = True
-                log.info("Processing with upstream TRELLIS.2 pipeline.run and o_voxel.to_glb")
+            if not self.legacy_processing:
+                log.info("Using upstream pipeline and exporter (models GPU-resident=%s)", not self.low_vram)
             self.stage = "moving_to_cuda"
             pipeline.cuda()
             model_mgr: VRAMModelManager | None = None
@@ -6481,10 +6487,11 @@ class Trellis2Engine:
         reported = self.vram_gb
         if reported is None:
             return
-        expected = 32 if pipeline_type == "1536_cascade" else 24
+        expected = 96 if pipeline_type == "1536_cascade" else 24
+        minimum = MIN_96GB_USABLE_GIB if expected == 96 else expected - 1
         # Driver reservations can reduce the CUDA-reported capacity below the
         # marketed capacity, such as 23.52 GiB on the 24 GB RTX 4090.
-        if not expected - 1 <= reported <= expected + 0.5:
+        if not minimum <= reported <= expected + 0.5:
             raise ValueError(
                 f"{pipeline_type} requires a {expected} GB GPU. "
                 f"This worker reports {reported:.2f} GiB. Use the {expected} GB endpoint."
