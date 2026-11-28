@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from runpod.server import MATERIAL_AUDIT_NAME, create_app
+from runpod.server import MATERIAL_AUDIT_NAME, PROJECTION_COMPARISON_NAME, create_app
 
 
 class JobSubmissionTests(unittest.TestCase):
@@ -22,6 +22,7 @@ class JobSubmissionTests(unittest.TestCase):
             generated.append(path.parent.name)
             path.write_bytes(b"test GLB")
             path.with_name(MATERIAL_AUDIT_NAME).write_bytes(b"test audit")
+            path.with_name(PROJECTION_COMPARISON_NAME).write_bytes(b"test comparison")
             finished.set()
 
         engine = SimpleNamespace(status="ready", stage="ready", generate_glb=generate)
@@ -42,4 +43,5 @@ class JobSubmissionTests(unittest.TestCase):
                 self.assertEqual(conflict.status_code, 409)
                 details = second.get(f"/jobs/{job}").json()
                 self.assertEqual(second.get(details["material_audit_url"]).content, b"test audit")
+                self.assertEqual(second.get(details["projection_comparison_url"]).content, b"test comparison")
             self.assertEqual(generated, [job])

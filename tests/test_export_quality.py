@@ -47,9 +47,11 @@ class ExportQualityTests(unittest.TestCase):
         bvh = Mock()
         bvh.unsigned_distance.return_value = (None, torch.zeros(3, dtype=torch.long),
                                               torch.tensor([[1., 0., 0.]] * 3))
-        projected = _project_bake_positions(points, bvh, vertices, faces, 1., 2., torch, normals)
+        unguarded = torch.empty_like(points)
+        projected = _project_bake_positions(points, bvh, vertices, faces, 1., 2., torch, normals, unguarded)
         torch.testing.assert_close(projected[0], points[0])
         torch.testing.assert_close(projected[1:], vertices[0].expand(2, 3))
+        torch.testing.assert_close(unguarded, vertices[0].expand(3, 3))
 
     def test_missing_material_samples_follow_surface(self):
         import cv2
@@ -167,8 +169,10 @@ class ExportQualityTests(unittest.TestCase):
             self.assertTrue(bool((attr_vol[:, 6] == 1).all()))
             out = torch.zeros((1, n_q, 7), dtype=torch.float32, device=grid.device)
             if n_q == 9 and float(grid[0, 1, 0]) > 768.0:
-                out[0, 1:, :3] = 0.95
-                out[0, 1:, 5:] = 1.0
+                projected_rows = grid[0, :, 0] > 768.0
+                out[0, projected_rows, :3] = 0.95
+                out[0, projected_rows, 3:5] = 0.65
+                out[0, projected_rows, 5:] = 1.0
             elif n_q == 2:
                 self.assertTrue(torch.allclose(grid[..., 0], torch.full((1, 2), 768.25, device=grid.device)))
                 out[0, :, :3] = 0.95
@@ -209,6 +213,14 @@ class ExportQualityTests(unittest.TestCase):
         class FakeTrimesh:
             def __init__(self, *a, **kw) -> None:
                 self.__dict__.update(kw)
+
+            def export(self, path, **_options):
+                with open(path, "wb") as stream:
+                    np.savez(
+                        stream, faces=self.faces,
+                        rgb=np.asarray(self.visual.material.baseColorTexture),
+                        pbr=np.asarray(self.visual.material.metallicRoughnessTexture),
+                    )
 
         def _marker_to_glb(*a, **kw):
             # Presence of 'remesh_narrow_band_dc' lets patch_o_voxel_postprocess recognize upstream to_glb
@@ -288,3 +300,13 @@ class ExportQualityTests(unittest.TestCase):
                 self.assertEqual(int(audit["source_valid"].sum()), 8)
                 self.assertTrue(audit["was_projected"][2])
                 np.testing.assert_array_equal(audit["source_rgb"][2], [242, 242, 242])
+
+            comparison = Path(temp_dir) / "mesh-projection-first.glb"
+            sample_counts.clear()
+            original = bake(material_audit_path=diagnostic, projection_comparison_path=comparison)
+            self.assertEqual(sample_counts, [9, 9])
+            with np.load(comparison) as variant:
+                np.testing.assert_array_equal(variant["faces"], original.faces)
+                np.testing.assert_array_equal(variant["rgb"][1, 1], [242, 242, 242, 255])
+                np.testing.assert_array_equal(variant["pbr"][1, 1], [0, 165, 165])
+            np.testing.assert_array_equal(np.asarray(original.visual.material.baseColorTexture), tex_arr)

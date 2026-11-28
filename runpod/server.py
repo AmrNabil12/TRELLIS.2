@@ -197,6 +197,7 @@ from pydantic import BaseModel, Field
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[0-9a-f]{32}$")
 MATERIAL_AUDIT_NAME = "material-audit.npz"
+PROJECTION_COMPARISON_NAME = "mesh-projection-first.glb"
 
 log = logging.getLogger("trellis2.server")
 logging.basicConfig(
@@ -4427,8 +4428,10 @@ def _extend_material_atlas(atlas: Any, covered: Any, supported: Any, surface_pos
 
 def _project_bake_positions(surface: Any, bvh: Any, vertices: Any, faces: Any,
                             voxel_size: Any, radius: float, torch: Any,
-                            surface_normals: Any = None) -> Any:
+                            surface_normals: Any = None, unguarded_positions: Any = None) -> Any:
     if len(faces) == 0:
+        if unguarded_positions is not None:
+            unguarded_positions.copy_(surface)
         return surface
     projected = torch.empty_like(surface)
     for start in range(0, len(surface), 1_000_000):
@@ -4438,6 +4441,8 @@ def _project_bake_positions(surface: Any, bvh: Any, vertices: Any, faces: Any,
         valid_face = (face_ids >= 0) & (face_ids < len(faces))
         triangles = vertices[faces[face_ids.clamp(0, len(faces) - 1)]]
         source = (triangles * weights.unsqueeze(-1)).sum(dim=1)
+        if unguarded_positions is not None:
+            unguarded_positions[start:start + len(batch)] = torch.where(valid_face[:, None], source, batch)
         distance_sq = ((source - batch) / voxel_size).square().sum(dim=1, keepdim=True)
         nearby = valid_face[:, None] & (distance_sq <= radius**2)
         if surface_normals is not None:
@@ -4484,6 +4489,8 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             verbose: bool = False,
             use_tqdm: bool = False,
             material_audit_path: Path | None = None,
+            projection_comparison_path: Path | None = None,
+            projection_comparison_webp: bool = False,
         ) -> Any:
             cumesh_local = postprocess_mod.cumesh
             dr_local = postprocess_mod.dr
@@ -4746,19 +4753,24 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             project_early = use_cuda and (
                 free_gb is None or free_gb < VRAM_SAFETY_FLOOR_GB + sample_bytes / 1024**3
             )
-            def project(positions: Any, face_ids: Any) -> Any:
+            def project(positions: Any, face_ids: Any, unguarded_positions: Any = None) -> Any:
                 nonlocal vertices, faces, bvh
                 if vertices is None:
                     vertices, faces = _to_dev(orig_verts_cpu), _to_dev(orig_faces_cpu)
                 if bvh is None:
                     bvh = cumesh_local.cuBVH(vertices, faces)
                 return _project_bake_positions(
-                    positions, bvh, vertices, faces, voxel_size, radius, t_mod, bake_face_normals[face_ids]
+                    positions, bvh, vertices, faces, voxel_size, radius, t_mod,
+                    bake_face_normals[face_ids], unguarded_positions,
                 )
 
             # A previously evicted BVH also needs its own allocation phase.
-            project_early = project_early or bvh is None or material_audit_path is not None
-            projected_pos = project(valid_pos, surface_face_ids) if project_early and n_valid else None
+            compare_projection = projection_comparison_path is not None
+            project_early = project_early or bvh is None or material_audit_path is not None or compare_projection
+            unguarded_positions = t_mod.empty_like(valid_pos) if compare_projection else None
+            projected_pos = (
+                project(valid_pos, surface_face_ids, unguarded_positions) if project_early and n_valid else None
+            )
             if project_early:
                 bvh = vertices = faces = None
                 _flush_allocator_for_cpp()
@@ -4766,6 +4778,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
             atlas = np_mod.zeros((texture_size, texture_size, attr_channels), dtype=np_mod.uint8)
             coverage = mask.cpu().numpy()
             bake_mask = mask.clone()
+            comparison_atlas = comparison_support = None
             if n_valid > 0:
                 # A real sample can have zero alpha. Interpolate a constant
                 # channel alongside the material to detect sparse-grid misses.
@@ -4790,16 +4803,34 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 sampled = _sample(valid_pos)
                 missing = sampled[:, attr_channels] <= 0
                 source_samples = None
+                if unguarded_positions is not None:
+                    source_samples = _sample(unguarded_positions)
+                    no_projection = source_samples[:, attr_channels] <= 0
+                    projected_samples = t_mod.where(no_projection[:, None], sampled, source_samples)
+                    comparison_atlas = np_mod.zeros_like(atlas)
+                    comparison_atlas[coverage] = (
+                        projected_samples[:, :attr_channels].float().mul(255).clamp_(0, 255).to(t_mod.uint8).cpu().numpy()
+                    )
+                    comparison_support = np_mod.zeros_like(coverage)
+                    comparison_support[coverage] = (projected_samples[:, attr_channels] > 0).cpu().numpy()
+                    log.info("Projection-first comparison: %d texels tried the direct fallback", int(no_projection.sum()))
+                    del projected_samples, no_projection
                 if material_audit_path is not None:
                     # Compare both sample positions on the exact same UVs so
                     # atlas placement and lighting cannot affect the comparison.
                     base_slice = attr_layout["base_color"]
                     direct_rgb = sampled[:, base_slice].float().mul(255).clamp_(0, 255).to(t_mod.uint8).cpu().numpy()
-                    source_samples = _sample(projected_pos)
+                    moved_from_surface = (projected_pos != valid_pos).any(dim=1)
+                    source_samples = (
+                        _sample(projected_pos)
+                        if source_samples is None
+                        else t_mod.where(moved_from_surface[:, None], source_samples, sampled)
+                    )
                     source_rgb = source_samples[:, base_slice].float().mul(255).clamp_(0, 255).to(t_mod.uint8).cpu().numpy()
                     direct_valid = (~missing).cpu().numpy()
                     source_valid = (source_samples[:, attr_channels] > 0).cpu().numpy()
-                    was_projected = (projected_pos != valid_pos).any(dim=1).cpu().numpy()
+                    was_projected = moved_from_surface.cpu().numpy()
+                    del moved_from_surface
                     temporary_audit = material_audit_path.with_suffix(".part")
                     try:
                         with temporary_audit.open("wb") as audit_file:
@@ -4828,7 +4859,7 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 log.info("Material bake: %d surface hits, %d projection recoveries, %d unsupported",
                          n_valid - int(missing.sum()), int((missing & supported).sum()), int((~supported).sum()))
                 del sampled, missing, missing_rows, supported, features, coords_batch, source_samples
-            del bake_face_normals, surface_face_ids
+            del bake_face_normals, surface_face_ids, unguarded_positions
             del attr_vol_staged, coords_staged, projected_pos, bvh, vertices, faces, orig_verts_cpu, orig_faces_cpu
             _flush_allocator_for_cpp()
 
@@ -4843,23 +4874,26 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 print("Finalizing mesh...", end="", flush=True)
 
             atlas = _extend_material_atlas(atlas, coverage, bake_mask.cpu().numpy(), valid_pos, postprocess_mod.cv2, np_mod)
-            del mask, bake_mask, coverage, valid_pos
-            base_color = atlas[..., attr_layout["base_color"]]
-            metallic = atlas[..., attr_layout["metallic"]]
-            roughness = atlas[..., attr_layout["roughness"]]
-            alpha = atlas[..., attr_layout["alpha"]]
 
-            material = trimesh_local.visual.material.PBRMaterial(
-                baseColorTexture=pil_image.fromarray(np_mod.concatenate([base_color, alpha], axis=-1)),
-                baseColorFactor=np_mod.array([255, 255, 255, 255], dtype=np_mod.uint8),
-                metallicRoughnessTexture=pil_image.fromarray(
-                    np_mod.concatenate([np_mod.zeros_like(metallic), roughness, metallic], axis=-1)
-                ),
-                metallicFactor=1.0,
-                roughnessFactor=1.0,
-                alphaMode="OPAQUE",
-                doubleSided=True if not remesh else False,
-            )
+            def build_material(pixels: Any) -> Any:
+                base_color = pixels[..., attr_layout["base_color"]]
+                metallic = pixels[..., attr_layout["metallic"]]
+                roughness = pixels[..., attr_layout["roughness"]]
+                alpha = pixels[..., attr_layout["alpha"]]
+                return trimesh_local.visual.material.PBRMaterial(
+                    baseColorTexture=pil_image.fromarray(np_mod.concatenate([base_color, alpha], axis=-1)),
+                    baseColorFactor=np_mod.array([255, 255, 255, 255], dtype=np_mod.uint8),
+                    metallicRoughnessTexture=pil_image.fromarray(
+                        np_mod.concatenate([np_mod.zeros_like(metallic), roughness, metallic], axis=-1)
+                    ),
+                    metallicFactor=1.0,
+                    roughnessFactor=1.0,
+                    alphaMode="OPAQUE",
+                    doubleSided=not remesh,
+                )
+
+            material = build_material(atlas)
+            del atlas, mask, bake_mask
 
             vertices_np = out_vertices.cpu().numpy()
             faces_np = out_faces.cpu().numpy()
@@ -4878,6 +4912,23 @@ def patch_o_voxel_postprocess(postprocess_mod: Any, torch_mod: Any = None) -> No
                 process=False,
                 visual=trimesh_local.visual.TextureVisuals(uv=uvs_np, material=material),
             )
+
+            if comparison_atlas is not None and projection_comparison_path is not None:
+                temporary_comparison = projection_comparison_path.with_name(".projection-first.tmp.glb")
+                try:
+                    comparison_atlas = _extend_material_atlas(
+                        comparison_atlas, coverage, comparison_support, valid_pos, postprocess_mod.cv2, np_mod
+                    )
+                    textured_mesh.visual.material = build_material(comparison_atlas)
+                    with _FastLosslessPngContext():
+                        textured_mesh.export(str(temporary_comparison), extension_webp=projection_comparison_webp)
+                    _atomic_replace(temporary_comparison, projection_comparison_path)
+                except (OSError, ValueError) as exc:
+                    log.warning("Could not export projection-first comparison (%s)", exc)
+                finally:
+                    textured_mesh.visual.material = material
+                    temporary_comparison.unlink(missing_ok=True)
+            del coverage, valid_pos
 
             if pbar is not None:
                 pbar.update(1)
@@ -6276,6 +6327,9 @@ class Trellis2Engine:
                 audit_options = {}
                 if postprocess_patched and os.environ.get("TRELLIS2_MATERIAL_AUDIT") == "1":
                     audit_options["material_audit_path"] = out_path.with_name(MATERIAL_AUDIT_NAME)
+                if postprocess_patched and os.environ.get("TRELLIS2_EXPORT_COMPARE") == "1":
+                    audit_options["projection_comparison_path"] = out_path.with_name(PROJECTION_COMPARISON_NAME)
+                    audit_options["projection_comparison_webp"] = params.extension_webp
                 glb = self._o_voxel.postprocess.to_glb(
                     vertices=bake_verts,
                     faces=bake_faces,
@@ -6412,6 +6466,8 @@ class JobRecord:
         if self.status == "completed" and self.glb_path is not None:
             if self.glb_path.with_name(MATERIAL_AUDIT_NAME).is_file():
                 payload["material_audit_url"] = f"/jobs/{self.job_id}/{MATERIAL_AUDIT_NAME}"
+            if self.glb_path.with_name(PROJECTION_COMPARISON_NAME).is_file():
+                payload["projection_comparison_url"] = f"/jobs/{self.job_id}/{PROJECTION_COMPARISON_NAME}"
         return payload
 
 
@@ -6875,14 +6931,21 @@ def create_app(
             filename=f"{job_id}.glb",
         )
 
-    @fastapi_app.get("/jobs/{job_id}/material-audit.npz", dependencies=[Depends(verify_api_key)])
-    def download_material_audit(job_id: str) -> FileResponse:
+    def download_comparison_artifact(job_id: str, filename: str, media_type: str) -> FileResponse:
         record = manager.get(job_id)
         if record is not None and record.status == "completed" and record.glb_path is not None:
-            audit = record.glb_path.with_name(MATERIAL_AUDIT_NAME)
-            if audit.is_file():
-                return FileResponse(audit, media_type="application/octet-stream", filename=MATERIAL_AUDIT_NAME)
-        raise HTTPException(status_code=404, detail="No material audit is available for this job.")
+            artifact = record.glb_path.with_name(filename)
+            if artifact.is_file():
+                return FileResponse(artifact, media_type=media_type, filename=filename)
+        raise HTTPException(status_code=404, detail=f"{filename} is unavailable for this job.")
+
+    @fastapi_app.get("/jobs/{job_id}/material-audit.npz", dependencies=[Depends(verify_api_key)])
+    def download_material_audit(job_id: str) -> FileResponse:
+        return download_comparison_artifact(job_id, MATERIAL_AUDIT_NAME, "application/octet-stream")
+
+    @fastapi_app.get("/jobs/{job_id}/mesh-projection-first.glb", dependencies=[Depends(verify_api_key)])
+    def download_projection_comparison(job_id: str) -> FileResponse:
+        return download_comparison_artifact(job_id, PROJECTION_COMPARISON_NAME, "model/gltf-binary")
 
     @fastapi_app.post("/generate", dependencies=[Depends(verify_api_key)])
     async def generate_sync(
