@@ -26,12 +26,14 @@ class ExportQualityTests(unittest.TestCase):
         exporter = engine._o_voxel.postprocess.to_glb
         exporter.return_value.export.side_effect = lambda path, **kw: Path(path).write_bytes(b"glb")
         stages = []
-        with tempfile.TemporaryDirectory() as directory:
+        with patch.dict(os.environ, {"TRELLIS2_TEXTURE_STEPS": "25"}), tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mesh.glb"
             engine.generate_glb(None, GenerationParams(pipeline_type="1536_cascade"),
                                 path, on_stage=stages.append)
             self.assertEqual(path.read_bytes(), b"glb")
-        engine._pipeline.run.assert_called_once()
+        engine._pipeline.run.assert_called_once_with(
+            None, seed=42, preprocess_image=True, pipeline_type="1536_cascade"
+        )
         engine._pipeline.decode_shape_slat.assert_not_called()
         mesh.simplify.assert_called_once_with(16_777_216)
         self.assertIs(exporter.call_args.kwargs["faces"], mesh.faces)

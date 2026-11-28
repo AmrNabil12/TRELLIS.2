@@ -5653,8 +5653,8 @@ class Trellis2Engine:
             self.gpu_name = props.name
             self.vram_gb = round(props.total_memory / (1024**3), 2)
             self.low_vram = _resolve_low_vram(self._low_vram_setting, self.vram_gb)
-            if self.vram_gb >= MIN_96GB_USABLE_GIB:
-                self.low_vram = False
+            reference_worker = self.vram_gb >= MIN_96GB_USABLE_GIB
+            if reference_worker:
                 self.legacy_processing = False
             stable_sampling = self.vram_gb >= 31.0
             if self.legacy_processing:
@@ -5712,7 +5712,10 @@ class Trellis2Engine:
             pipeline = Trellis2ImageTo3DPipeline.from_pretrained(self.model_id)
             log.info("Post-load HF storage status: %s", _hf_cache_summary())
             # low_vram MUST be set before pipeline.cuda() because Pipeline.to() checks self.low_vram
-            pipeline.low_vram = self.low_vram
+            if reference_worker:
+                self.low_vram = pipeline.low_vram
+            else:
+                pipeline.low_vram = self.low_vram
             if self.legacy_processing:
                 install_trellis2_vram_optimizations(
                     pipeline,
@@ -5721,7 +5724,7 @@ class Trellis2Engine:
                     vram_gb=self.vram_gb,
                     stable_sampling=stable_sampling,
                 )
-            elif self.low_vram:
+            elif self.low_vram and not reference_worker:
                 from trellis2.models.sc_vaes.sparse_unet_vae import SparseConvNeXtBlock3d
                 from trellis2.modules.norm import LayerNorm32
 
@@ -6356,25 +6359,22 @@ class Trellis2Engine:
                         "preprocess_image": params.preprocess_image,
                         "pipeline_type": pipeline_type,
                     }
-                    try:
-                        if "max_num_tokens" in inspect.signature(self._pipeline.run).parameters:
-                            run_kwargs["max_num_tokens"] = int(
-                                os.environ.get("TRELLIS2_MAX_NUM_TOKENS", str(DEFAULT_MAX_NUM_TOKENS))
-                            )
-                    except (TypeError, ValueError):
-                        pass
-                    shape_overrides, texture_overrides = _sampler_overrides()
-                    if shape_overrides:
-                        run_kwargs["shape_slat_sampler_params"] = shape_overrides
-                    if texture_overrides:
-                        run_kwargs["tex_slat_sampler_params"] = texture_overrides
+                    if pipeline_type != "1536_cascade":
+                        try:
+                            if "max_num_tokens" in inspect.signature(self._pipeline.run).parameters:
+                                run_kwargs["max_num_tokens"] = int(
+                                    os.environ.get("TRELLIS2_MAX_NUM_TOKENS", str(DEFAULT_MAX_NUM_TOKENS))
+                                )
+                        except (TypeError, ValueError):
+                            pass
+                        shape_overrides, texture_overrides = _sampler_overrides()
+                        if shape_overrides:
+                            run_kwargs["shape_slat_sampler_params"] = shape_overrides
+                        if texture_overrides:
+                            run_kwargs["tex_slat_sampler_params"] = texture_overrides
                     mesh = self._pipeline.run(image, **run_kwargs)[0]
-                    if (pipeline_type == "1536_cascade" and "max_num_tokens" in run_kwargs
-                            and isinstance(mesh.voxel_size, (float, int))):
-                        resolution = round(1 / mesh.voxel_size)
-                        if resolution != 1536:
-                            raise ValueError(f"Requested 1536 cascade produced resolution {resolution}; "
-                                             "increase TRELLIS2_MAX_NUM_TOKENS for this input")
+                    if pipeline_type == "1536_cascade" and isinstance(mesh.voxel_size, (float, int)):
+                        log.info("Upstream cascade decoded at resolution %d", round(1 / mesh.voxel_size))
 
                 # Free neural models before CuMesh/cuBVH/nvdiffrast high-res baking (no models needed after decode)
                 if self._model_mgr is not None:
