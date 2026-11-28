@@ -5718,6 +5718,9 @@ class Trellis2Engine:
                 )
             else:
                 from trellis2.models.sc_vaes.sparse_unet_vae import SparseConvNeXtBlock3d
+                from trellis2.modules.norm import LayerNorm32
+
+                patch_layernorm32(LayerNorm32, torch)
 
                 # The expanded Linear output feeds only SiLU. Reuse it during
                 # inference instead of allocating a second full voxel activation.
