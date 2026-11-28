@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
 ARG MAX_JOBS=4
 ARG TRELLIS2_REPO=https://github.com/AmrNabil12/TRELLIS.2.git
@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:${PATH} \
-    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0" \
     MAX_JOBS=${MAX_JOBS}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -42,8 +42,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf /usr/bin/python3 /usr/bin/python && \
     python -m pip install --upgrade pip setuptools wheel packaging ninja
 
-# Install PyTorch 2.6.0 + CUDA 12.4
-RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+# The CUDA 12.8 wheels include native Blackwell (sm_120) support.
+RUN pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
 
 # Install core Python & FastAPI dependencies
 # transformers is pinned to >=4.56.0,<5.0.0: DINOv3ViTModel requires >=4.56.0 while briaai/RMBG-2.0 breaks on >=5.0.0
@@ -72,9 +72,12 @@ RUN pip install \
     pydantic && \
     pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
 
-# Install prebuilt flash-attn 2.7.3 wheel matching PyTorch's C++11 ABI
+# Install a FlashAttention wheel matching PyTorch's C++11 ABI and verify both GPU targets.
 RUN ABI=$(python -c "import torch; print('TRUE' if torch.compiled_with_cxx11_abi() else 'FALSE')") && \
-    pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3%2Bcu12torch2.6cxx11abi${ABI}-cp310-cp310-linux_x86_64.whl"
+    pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.7cxx11abi${ABI}-cp310-cp310-linux_x86_64.whl" && \
+    python -c "import torch, flash_attn; assert {'sm_86', 'sm_120'} <= set(torch._C._cuda_getArchFlags().split())" && \
+    FLASH_ATTN_SO=$(python -c "from importlib.util import find_spec; print(find_spec('flash_attn_2_cuda').origin)") && \
+    cuobjdump --list-elf "$FLASH_ATTN_SO" | grep -q 'sm_120'
 
 # Compile & install CUDA extensions in cached layers
 RUN git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/nvdiffrast && \

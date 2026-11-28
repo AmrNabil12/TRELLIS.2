@@ -6278,6 +6278,21 @@ class Trellis2Engine:
             else:
                 self._release_vram(offload_models=True)
 
+    def validate_pipeline_gpu(self, pipeline_type: str) -> None:
+        # Device properties are populated during startup. Queued jobs are
+        # checked again before inference once the model is ready.
+        reported = self.vram_gb
+        if reported is None:
+            return
+        expected = 32 if pipeline_type == "1536_cascade" else 24
+        # Driver reservations can reduce the CUDA-reported capacity below the
+        # marketed capacity, such as 23.52 GiB on the 24 GB RTX 4090.
+        if not expected - 1 <= reported <= expected + 0.5:
+            raise ValueError(
+                f"{pipeline_type} requires a {expected} GB GPU. "
+                f"This worker reports {reported:.2f} GiB. Use the {expected} GB endpoint."
+            )
+
     def generate_glb(
         self,
         image: Image.Image,
@@ -6288,6 +6303,7 @@ class Trellis2Engine:
         if self.status != "ready" or self._pipeline is None:
             raise RuntimeError(f"Model is not ready (status={self.status}, error={self.error})")
 
+        self.validate_pipeline_gpu(params.pipeline_type)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with self._gpu_lock:
             try:
@@ -6669,6 +6685,13 @@ def create_app(
 
     manager = JobManager(resolved_engine, resolved_jobs_dir)
 
+    def check_job_gpu(params: GenerationParams) -> None:
+        if isinstance(resolved_engine, Trellis2Engine):
+            try:
+                resolved_engine.validate_pipeline_gpu(params.pipeline_type)
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+
     def verify_api_key(
         authorization: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None),
@@ -6729,6 +6752,7 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"TRELLIS.2 failed to initialize: {resolved_engine.error}",
             )
+        check_job_gpu(params)
         pil_image = _decode_uploaded_image(await image.read())
         record = manager.submit(pil_image, params)
         return {
@@ -6775,6 +6799,7 @@ def create_app(
         params: GenerationParams = Depends(parse_generation_params),
     ) -> Response:
         _require_ready_engine(resolved_engine)
+        check_job_gpu(params)
         pil_image = _decode_uploaded_image(await image.read())
         with tempfile.TemporaryDirectory() as tmp:
             out_path = Path(tmp) / "mesh.glb"
