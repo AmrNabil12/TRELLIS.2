@@ -98,7 +98,9 @@ RUN git clone --recursive https://github.com/JeffreyXiang/FlexGEMM.git /tmp/Flex
     rm -rf /tmp/FlexGEMM
 
 # Clone TRELLIS.2 fork outside /workspace (RunPod mounts persistent volume on /workspace) and build o-voxel
+COPY material-sampling.patch /tmp/material-sampling.patch
 RUN git clone --recursive -b "${TRELLIS2_BRANCH}" "${TRELLIS2_REPO}" /opt/TRELLIS.2 && \
+    git -C /opt/TRELLIS.2 apply /tmp/material-sampling.patch && \
     cp -r /opt/TRELLIS.2/o-voxel /tmp/o-voxel && \
     pip install /tmp/o-voxel --no-build-isolation && \
     rm -rf /tmp/o-voxel

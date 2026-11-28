@@ -6359,14 +6359,14 @@ class Trellis2Engine:
                         "preprocess_image": params.preprocess_image,
                         "pipeline_type": pipeline_type,
                     }
+                    try:
+                        if "max_num_tokens" in inspect.signature(self._pipeline.run).parameters:
+                            run_kwargs["max_num_tokens"] = int(
+                                os.environ.get("TRELLIS2_MAX_NUM_TOKENS", str(DEFAULT_MAX_NUM_TOKENS))
+                            )
+                    except (TypeError, ValueError):
+                        pass
                     if pipeline_type != "1536_cascade":
-                        try:
-                            if "max_num_tokens" in inspect.signature(self._pipeline.run).parameters:
-                                run_kwargs["max_num_tokens"] = int(
-                                    os.environ.get("TRELLIS2_MAX_NUM_TOKENS", str(DEFAULT_MAX_NUM_TOKENS))
-                                )
-                        except (TypeError, ValueError):
-                            pass
                         shape_overrides, texture_overrides = _sampler_overrides()
                         if shape_overrides:
                             run_kwargs["shape_slat_sampler_params"] = shape_overrides

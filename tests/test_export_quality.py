@@ -1,3 +1,4 @@
+import inspect
 import os
 import tempfile
 from pathlib import Path
@@ -22,17 +23,20 @@ class ExportQualityTests(unittest.TestCase):
         engine._pipeline = Mock()
         engine._pipeline.models = {}
         engine._pipeline.run.return_value = [mesh]
+        engine._pipeline.run.__signature__ = inspect.signature(
+            lambda image, *, seed, preprocess_image, pipeline_type, max_num_tokens: None
+        )
         engine._o_voxel = SimpleNamespace(postprocess=SimpleNamespace(to_glb=Mock()))
         exporter = engine._o_voxel.postprocess.to_glb
         exporter.return_value.export.side_effect = lambda path, **kw: Path(path).write_bytes(b"glb")
         stages = []
-        with patch.dict(os.environ, {"TRELLIS2_TEXTURE_STEPS": "25"}), tempfile.TemporaryDirectory() as directory:
+        with patch.dict(os.environ, {"TRELLIS2_TEXTURE_STEPS": "25", "TRELLIS2_MAX_NUM_TOKENS": "81920"}), tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mesh.glb"
             engine.generate_glb(None, GenerationParams(pipeline_type="1536_cascade"),
                                 path, on_stage=stages.append)
             self.assertEqual(path.read_bytes(), b"glb")
         engine._pipeline.run.assert_called_once_with(
-            None, seed=42, preprocess_image=True, pipeline_type="1536_cascade"
+            None, seed=42, preprocess_image=True, pipeline_type="1536_cascade", max_num_tokens=81920
         )
         engine._pipeline.decode_shape_slat.assert_not_called()
         mesh.simplify.assert_called_once_with(16_777_216)
