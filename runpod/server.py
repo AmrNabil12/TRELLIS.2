@@ -5717,6 +5717,15 @@ class Trellis2Engine:
                     stable_sampling=stable_sampling,
                 )
             else:
+                from trellis2.models.sc_vaes.sparse_unet_vae import SparseConvNeXtBlock3d
+
+                # The expanded Linear output feeds only SiLU. Reuse it during
+                # inference instead of allocating a second full voxel activation.
+                for block in pipeline.models["shape_slat_decoder"].modules():
+                    if isinstance(block, SparseConvNeXtBlock3d):
+                        activation = block.mlp[1]
+                        if isinstance(activation, torch.nn.SiLU):
+                            activation.inplace = True
                 log.info("Processing with upstream TRELLIS.2 pipeline.run and o_voxel.to_glb")
             self.stage = "moving_to_cuda"
             pipeline.cuda()
